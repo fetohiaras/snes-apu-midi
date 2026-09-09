@@ -1,0 +1,11 @@
+// Tang Primer 25K (GW5A-LV25MG121NC1/I0):
+//   - 50 MHz FPGA oscillator, net CLK, on E2
+//   - onboard S_READY LED on E8
+// In Project -> Configuration -> Place & Route -> Dual-Purpose Pin, enable
+// CPU as regular GPIO and READY as regular GPIO.
+
+IO_LOC "clk_50m" E2;
+IO_PORT "clk_50m" IO_TYPE=LVCMOS33 PULL_MODE=DOWN DRIVE=OFF BANK_VCCIO=3.3;
+
+IO_LOC "led_ready" E8;
+IO_PORT "led_ready" IO_TYPE=LVCMOS33 PULL_MODE=NONE DRIVE=8 BANK_VCCIO=3.3;

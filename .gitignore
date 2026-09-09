@@ -1,0 +1,25 @@
+# Gowin FPGA Designer generated implementation products
+**/impl/
+**/temp/
+**/*.gprj.user
+**/*_tmp.v
+**/*.log
+**/*.bin
+**/*.binx
+**/*.fs
+**/*.db
+**/*.pr
+**/*.p
+
+# Verilator build products and generated media
+**/obj_dir/
+**/output/
+**/*.vcd
+**/*.fst
+**/*.aud
+**/*.wav
+
+# Copyrighted game snapshots and images generated from them are local test
+# inputs.  The tracked README explains how each collaborator generates one.
+/sim/data/
+/src/data/*.hex
