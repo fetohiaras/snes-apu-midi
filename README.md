@@ -3,14 +3,12 @@
 Projeto para a disciplina ENGG54 - Laboratório Integrado III, consistindo na
 implementação de um sintetizador MIDI baseado no subsistema de 
 áudio (SPC700 e S-DSP) do SNES para a placa Sipeed Tang Primer
-25K (`GW5A-LV25MG121NC1/I0`).
+25K (`GW5A-LV25MG121NC1/I0, Version A`).
 
 ## Alvo de síntese
 
 O alvo de síntese atual carrega um arquivo .SPC na memória da APU, roda o 
 núcleo a 24.528MHz, e usa o LED READY como indicador de funcionamento.
-- Dispositivo: GW5A-LV25MG121NC1/I0, device version A
-
 
 ## Organização
 
@@ -43,11 +41,6 @@ make run
 ```
 
 ## Compilação e programação
-
-Open `primer25k_nanospc.gprj` with Gowin FPGA Designer Education, select the
-recorded target device, run Synthesis and Place & Route, then program the
-generated `.fs` image in external-flash mode.  The clock input is E2 (50 MHz)
-and the READY LED is E8.
 
 Abra o projeto `primer25k_nanospc.gprj` na Gowin IDE, selecione o alvo,
 execute Synthesis e Place & Route. Certifique-se de que estas opções estão ativadas:
