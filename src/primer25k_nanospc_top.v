@@ -1,21 +1,42 @@
 `timescale 1ns/1ps
 
-// Standalone SNES APU smoke test for the Sipeed Tang Primer 25K.
+// SNES APU MIDI synthesizer for the Sipeed Tang Primer 25K.
 //
-// This deliberately omits NanoSPC's HDMI, MicroSD, UART, and user-interface
-// layers.  It bootstraps the bundled SPC image from inferred A-RAM, runs the
-// S-SMP/SPC700 plus S-DSP, and turns the READY LED into a run-status indicator.
-module primer25k_nanospc_top (
+//   midi_rx (31250 8N1) -> uart_rx -> midi_parser -> midi_mailbox
+//     -> APU I/O ports -> SPC700 MIDI driver -> S-DSP -> i2s_tx -> PCM5102A
+//
+// BOOT_IMAGE is the A-RAM/register image the APU boots from; by default the
+// MIDI driver image built by tools/build_midi_image.py (see README).
+module primer25k_nanospc_top #(
+    parameter         BOOT_IMAGE = "src/data/midi_boot.spc.hex",
+    parameter integer MIDI_BAUD  = 31250
+) (
     input  wire clk_50m,
-    output wire led_ready
+    input  wire midi_rx,
+    output wire led_ready,
+    // PCM5102A: SCK tied low (internal PLL), FMT low (I2S).
+    output wire i2s_bclk,
+    output wire i2s_lrclk,
+    output wire i2s_sdata
 `ifdef VERILATOR
     // These ports exist solely in the C++ simulation model.  They are absent
     // from the synthesis elaboration and therefore do not consume FPGA pins.
-    ,output wire sim_snd_rdy
+    ,output wire        sim_running
+    ,output wire        sim_snd_rdy
     ,output wire [15:0] sim_audio_l
     ,output wire [15:0] sim_audio_r
+    ,output wire        sim_ev_valid
+    ,output wire [7:0]  sim_ev_status
+    ,output wire [6:0]  sim_ev_data1
+    ,output wire [6:0]  sim_ev_data2
+    ,output wire [15:0] sim_mb_sent
+    ,output wire        sim_mb_dropped
+    ,output wire        sim_mb_timeout
+    ,output wire        sim_mb_busy
 `endif
 );
+
+    localparam integer DCLK_HZ = 24528000;
 
     // ------------------------------------------------------------------------
     // Clock and power-on reset
@@ -49,181 +70,115 @@ module primer25k_nanospc_top (
     end
 
     // ------------------------------------------------------------------------
-    // S-SMP/SPC700 <-> S-DSP <-> shared 64 KiB A-RAM
+    // MIDI input
     // ------------------------------------------------------------------------
-    wire        smp_en;
-    wire        smp_we_n;
-    wire [15:0] smp_a;
-    wire [7:0]  smp_do;
-    wire [7:0]  smp_di;
+    wire [7:0] rx_byte;
+    wire       rx_valid;
+    wire       ev_valid;
+    wire [7:0] ev_status;
+    wire [6:0] ev_data1;
+    wire [6:0] ev_data2;
 
-    wire [15:0] ram_a;
-    wire [7:0]  ram_din;
-    wire [7:0]  ram_dout;
-    wire        ram_wr;
-
-    wire [2:0]  dsp_phase;
-    wire        dsp_last_phase;
-    // Kept public only for the Verilator smoke-capture harness.  The comments
-    // are ignored by synthesis and do not add FPGA I/O.
-    wire        snd_rdy /* verilator public */;
-    wire [15:0] audio_l /* verilator public */;
-    wire [15:0] audio_r /* verilator public */;
-
-    // The parser loads CPU, S-SMP, and S-DSP registers from the SPC image
-    // while the APU is disabled.  Only after parser_done may the real CPU run.
-    wire        parser_done;
-    wire        parser_rd;
-    wire [16:0] parser_a;
-    wire        cpu_dbg_wr;
-    wire        smp_dbg_wr;
-    wire [7:0]  smpcpu_dbg_reg;
-    wire [7:0]  smpcpu_dbg_din;
-    wire        dsp_dbg_wr;
-    wire [7:0]  dsp_dbg_reg;
-    wire [7:0]  dsp_dbg_din;
-
-    reg         parser_start = 1'b0;
-    reg         core_enable = 1'b0;
-    reg         spc_reset = 1'b1;
-
-    localparam [1:0] BOOT_RESET = 2'd0;
-    localparam [1:0] BOOT_PARSE = 2'd1;
-    localparam [1:0] BOOT_RUN   = 2'd2;
-    reg [1:0] boot_state = BOOT_RESET;
-
-    always @(posedge dclk) begin
-        if (!resetn) begin
-            boot_state   <= BOOT_RESET;
-            parser_start <= 1'b0;
-            core_enable  <= 1'b0;
-            spc_reset    <= 1'b1;
-        end else begin
-            // parser_start is a one-clock pulse.
-            parser_start <= 1'b0;
-
-            case (boot_state)
-                BOOT_RESET: begin
-                    core_enable  <= 1'b0;
-                    spc_reset    <= 1'b1;
-                    parser_start <= 1'b1;
-                    boot_state   <= BOOT_PARSE;
-                end
-
-                BOOT_PARSE: begin
-                    // Release the APU reset.  With core_enable still low,
-                    // debug writes from spc_parser initialise its state.
-                    spc_reset <= 1'b0;
-                    if (parser_done) begin
-                        core_enable <= 1'b1;
-                        boot_state  <= BOOT_RUN;
-                    end
-                end
-
-                default: begin
-                    spc_reset   <= 1'b0;
-                    core_enable <= 1'b1;
-                end
-            endcase
-        end
-    end
-
-    wire apu_resetn = resetn & ~spc_reset;
-
-    SMP smp (
-        .CLK             (dclk),
-        .RST_N           (apu_resetn),
-        .ENABLE          (core_enable & smp_en & dsp_last_phase),
-        .A               (smp_a),
-        .DI              (smp_di),
-        .DO              (smp_do),
-        .WE_N            (smp_we_n),
-        .PA              (2'b00),
-        .PARD_N          (1'b1),
-        .PAWR_N          (1'b1),
-        .CPU_DI          (8'h00),
-        .CPU_DO          (),
-        .CS              (1'b0),
-        .CS_N            (1'b1),
-        .DBG_REG         (smpcpu_dbg_reg),
-        .DBG_DAT_IN      (smpcpu_dbg_din),
-        .DBG_SMP_DAT     (),
-        .DBG_CPU_DAT     (),
-        .DBG_CPU_DAT_WR  (cpu_dbg_wr),
-        .DBG_SMP_DAT_WR  (smp_dbg_wr),
-        .BRK_OUT         ()
+    uart_rx #(.CLK_HZ(DCLK_HZ), .BAUD(MIDI_BAUD)) midi_uart (
+        .clk       (dclk),
+        .resetn    (resetn),
+        .rx        (midi_rx),
+        .data      (rx_byte),
+        .valid     (rx_valid),
+        .frame_err ()
     );
 
-    DSP dsp (
-        .CLK         (dclk),
-        .RST_N       (apu_resetn),
-        .ENABLE      (core_enable),
-        .PHASE       (dsp_phase),
-        .LAST_PHASE  (dsp_last_phase),
-        .SMP_EN      (smp_en),
-        .SMP_A       (smp_a),
-        .SMP_DO      (smp_do),
-        .SMP_DI      (smp_di),
-        .SMP_WE_N    (smp_we_n),
-        .RAM_A       (ram_a),
-        .RAM_DI      (ram_dout),
-        .RAM_DO      (ram_din),
-        .RAM_WR      (ram_wr),
-        .LRCK        (),
-        .BCK         (),
-        .SDAT        (),
-        .SND_RDY     (snd_rdy),
-        .AUDIO_L     (audio_l),
-        .AUDIO_R     (audio_r),
-        .DBG_REG     (dsp_dbg_reg),
-        .DBG_DAT_IN  (dsp_dbg_din),
-        .DBG_DAT_OUT (),
-        .DBG_DAT_WR  (dsp_dbg_wr)
+    midi_parser parser (
+        .clk       (dclk),
+        .resetn    (resetn),
+        .in_valid  (rx_valid),
+        .in_byte   (rx_byte),
+        .ev_valid  (ev_valid),
+        .ev_status (ev_status),
+        .ev_data1  (ev_data1),
+        .ev_data2  (ev_data2)
     );
 
-    test_aram #(
-        .MEM_INIT_FILE("src/data/test_spc.spc.hex")
-    ) aram (
-        .clk    (dclk),
-        .din    (ram_din),
-        .dout   (ram_dout),
-        .wr     (ram_wr),
-        .a      (ram_a),
-        .spc_rd (parser_rd),
-        .spc_wr (1'b0),
-        .spc_a  (parser_a),
-        .length (),
-        .fade   ()
+    // ------------------------------------------------------------------------
+    // Mailbox -> APU
+    // ------------------------------------------------------------------------
+    wire        apu_running;
+    wire [1:0]  port_a;
+    wire        port_wr_n;
+    wire        port_cs;
+    wire [7:0]  port_din;
+    wire [7:0]  port_dout;
+    wire [15:0] mb_sent;
+    wire        mb_dropped;
+    wire        mb_timeout;
+    wire        mb_busy;
+
+    midi_mailbox mb (
+        .clk         (dclk),
+        .resetn      (resetn),
+        .apu_running (apu_running),
+        .ev_valid    (ev_valid),
+        .ev_status   (ev_status),
+        .ev_data1    (ev_data1),
+        .ev_data2    (ev_data2),
+        .port_a      (port_a),
+        .port_wr_n   (port_wr_n),
+        .port_cs     (port_cs),
+        .port_din    (port_din),
+        .port_dout   (port_dout),
+        .sent_count  (mb_sent),
+        .dropped     (mb_dropped),
+        .ack_timeout (mb_timeout),
+        .busy        (mb_busy)
     );
 
-    spc_parser parser (
-        .clk             (dclk),
-        .resetn          (resetn),
-        .start           (parser_start),
-        .done            (parser_done),
-        .parser_rd       (parser_rd),
-        .parser_a        (parser_a),
-        .aram_dout       (ram_dout),
-        .cpu_dbg_wr      (cpu_dbg_wr),
-        .smp_dbg_wr      (smp_dbg_wr),
-        .smpcpu_dbg_reg  (smpcpu_dbg_reg),
-        .smpcpu_dbg_din  (smpcpu_dbg_din),
-        .dsp_dbg_wr      (dsp_dbg_wr),
-        .dsp_dbg_reg     (dsp_dbg_reg),
-        .dsp_dbg_din     (dsp_dbg_din)
+    wire        snd_rdy;
+    wire [15:0] audio_l;
+    wire [15:0] audio_r;
+
+    apu_core #(
+        .MEM_INIT_FILE(BOOT_IMAGE)
+    ) apu (
+        .clk       (dclk),
+        .resetn    (resetn),
+        .running   (apu_running),
+        .port_a    (port_a),
+        .port_wr_n (port_wr_n),
+        .port_cs   (port_cs),
+        .port_din  (port_din),
+        .port_dout (port_dout),
+        .snd_rdy   (snd_rdy),
+        .audio_l   (audio_l),
+        .audio_r   (audio_r)
+    );
+
+    // ------------------------------------------------------------------------
+    // I2S output
+    // ------------------------------------------------------------------------
+    // Reset only by power-on so the DAC sees stable clocks (and silence)
+    // while the SPC image is still being parsed.
+    i2s_tx i2s (
+        .clk          (dclk),
+        .resetn       (resetn),
+        .sample_valid (snd_rdy),
+        .sample_l     (audio_l),
+        .sample_r     (audio_r),
+        .bclk         (i2s_bclk),
+        .lrclk        (i2s_lrclk),
+        .sdata        (i2s_sdata)
     );
 
     // ------------------------------------------------------------------------
     // Status LED
     // ------------------------------------------------------------------------
-    // Before audible PCM is observed, a solid LED means the snapshot parser
-    // completed.  Once non-zero samples arrive, bit 14 gives an approximately
-    // 1 Hz visible blink at a 32 kHz sample rate.
+    // Solid once the APU is running; after the first non-zero sample, bit 14
+    // of the sample counter blinks it at ~1 Hz. A mailbox error (driver not
+    // acknowledging, or command FIFO overflow) turns it off.
     reg [14:0] sample_count = 15'd0;
     reg        audio_seen = 1'b0;
 
     always @(posedge dclk) begin
-        if (!apu_resetn) begin
+        if (!apu_running) begin
             sample_count <= 15'd0;
             audio_seen   <= 1'b0;
         end else if (snd_rdy) begin
@@ -233,15 +188,25 @@ module primer25k_nanospc_top (
         end
     end
 
-    assign led_ready = !resetn      ? 1'b0 :
-                       !core_enable ? 1'b0 :
-                       !audio_seen  ? 1'b1 :
-                                      sample_count[14];
+    assign led_ready = !resetn                  ? 1'b0 :
+                       !apu_running             ? 1'b0 :
+                       (mb_timeout | mb_dropped) ? 1'b0 :
+                       !audio_seen              ? 1'b1 :
+                                                  sample_count[14];
 
 `ifdef VERILATOR
-    assign sim_snd_rdy = snd_rdy;
-    assign sim_audio_l = audio_l;
-    assign sim_audio_r = audio_r;
+    assign sim_running    = apu_running;
+    assign sim_snd_rdy    = snd_rdy;
+    assign sim_audio_l    = audio_l;
+    assign sim_audio_r    = audio_r;
+    assign sim_ev_valid   = ev_valid;
+    assign sim_ev_status  = ev_status;
+    assign sim_ev_data1   = ev_data1;
+    assign sim_ev_data2   = ev_data2;
+    assign sim_mb_sent    = mb_sent;
+    assign sim_mb_dropped = mb_dropped;
+    assign sim_mb_timeout = mb_timeout;
+    assign sim_mb_busy    = mb_busy;
 `endif
 
 endmodule

@@ -9,6 +9,11 @@
         <File path="src/gowin_pll/gowin_pll_mod.v" type="file.verilog" enable="1"/>
         <File path="src/pll_init.v" type="file.verilog" enable="1"/>
         <File path="src/primer25k_nanospc_top.v" type="file.verilog" enable="1"/>
+        <File path="src/apu_core.v" type="file.verilog" enable="1"/>
+        <File path="src/i2s_tx.v" type="file.verilog" enable="1"/>
+        <File path="src/midi/uart_rx.v" type="file.verilog" enable="1"/>
+        <File path="src/midi/midi_parser.v" type="file.verilog" enable="1"/>
+        <File path="src/midi/midi_mailbox.v" type="file.verilog" enable="1"/>
         <File path="src/spc_core/dsp.v" type="file.verilog" enable="1"/>
         <File path="src/spc_core/smp.v" type="file.verilog" enable="1"/>
         <File path="src/spc_core/spc700/_spc700_package.v" type="file.verilog" enable="1"/>

@@ -9,3 +9,19 @@ IO_PORT "clk_50m" IO_TYPE=LVCMOS33 PULL_MODE=DOWN DRIVE=OFF BANK_VCCIO=3.3;
 
 IO_LOC "led_ready" E8;
 IO_PORT "led_ready" IO_TYPE=LVCMOS33 PULL_MODE=NONE DRIVE=8 BANK_VCCIO=3.3;
+
+// MIDI input, 31250 baud 8N1. B3 is the FPGA UART RX driven by the dock's
+// BL616 USB-serial bridge (net B3_IOB56A_FPGA_UART_RX); a DIN-MIDI opto
+// receiver would use a PMOD pin instead.
+IO_LOC "midi_rx" B3;
+IO_PORT "midi_rx" IO_TYPE=LVCMOS33 PULL_MODE=UP BANK_VCCIO=3.3;
+
+// PCM5102A I2S DAC. TODO: pick three pins on a 3.3 V PMOD of the dock from
+// the Tang Primer 25K schematic and uncomment the IO_LOC lines; without them
+// the placer assigns arbitrary pins.
+// IO_LOC "i2s_bclk"  <pin>;
+// IO_LOC "i2s_lrclk" <pin>;
+// IO_LOC "i2s_sdata" <pin>;
+IO_PORT "i2s_bclk"  IO_TYPE=LVCMOS33 PULL_MODE=NONE DRIVE=8 BANK_VCCIO=3.3;
+IO_PORT "i2s_lrclk" IO_TYPE=LVCMOS33 PULL_MODE=NONE DRIVE=8 BANK_VCCIO=3.3;
+IO_PORT "i2s_sdata" IO_TYPE=LVCMOS33 PULL_MODE=NONE DRIVE=8 BANK_VCCIO=3.3;

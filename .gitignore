@@ -13,6 +13,11 @@
 
 # Verilator build products and generated media
 **/obj_dir/
+**/obj_i2s/
+**/obj_midi/
+**/obj_apu_midi/
+**/obj_top_midi/
+/sim/build_midi/
 **/output/
 **/*.vcd
 **/*.fst
@@ -23,3 +28,9 @@
 # inputs.  The tracked README explains how each collaborator generates one.
 /sim/data/
 /src/data/*.hex
+
+# Python bytecode
+**/__pycache__/
+
+# Docs
+/docs/*
