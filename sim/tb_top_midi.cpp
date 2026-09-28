@@ -1,12 +1,14 @@
 // Full-chain integration run of primer25k_nanospc_top:
 //   midi_rx pin -> UART -> MIDI parser -> mailbox -> SPC700 driver -> S-DSP
-//   -> I2S pins, plus the status LED.
+//   -> I2S pins and the PC audio stream on uart_tx, plus the status LED.
 //
-// Usage: Vprimer25k_nanospc_top UART.txt FRAMES OUTDIR
+// Usage: Vprimer25k_nanospc_top UART.txt FRAMES OUTDIR BAUD
 //   UART.txt lines: "<clock> <byte>" -- start-bit time of each byte in clocks
-//   since the APU started running (31250 baud, 8N1).
+//   since the APU started running (8N1 at BAUD, which must match the top's
+//   UART_BAUD).
 // Writes OUTDIR/top_midi.wav (parallel APU output), OUTDIR/top_midi_i2s.wav
-// (every frame decoded from the I2S pins), OUTDIR/top_events.txt (parser
+// (every frame decoded from the I2S pins), OUTDIR/top_pc_bytes.bin (raw bytes
+// received from uart_tx), OUTDIR/top_events.txt (parser
 // events as "<clock> <status> <d1> <d2>", replayable by tb_apu_midi) and
 // OUTDIR/top_summary.txt. check_top_midi.py evaluates them.
 #include <cstdint>
@@ -19,7 +21,6 @@
 #include "verilated.h"
 
 static constexpr double CLK_HZ = 24528000.0;
-static constexpr double BAUD = 31250.0;
 
 struct Frame {
     std::uint16_t l, r;
@@ -58,6 +59,39 @@ private:
     std::uint16_t word_ = 0, left_ = 0;
 };
 
+// 8N1 receiver sampling each bit at its centre, like a PC UART.
+class UartModel {
+public:
+    explicit UartModel(double cpb) : cpb_(cpb) {}
+    std::vector<std::uint8_t> bytes;
+    int frame_errors = 0;
+    void clock(bool v, std::uint64_t t) {
+        if (!busy_) {
+            if (prev_ && !v) { busy_ = true; start_ = t; bit_ = 0; data_ = 0; }
+        } else {
+            const double rel = static_cast<double>(t - start_);
+            while (busy_ && rel >= (bit_ + 0.5) * cpb_) {
+                if (bit_ == 0) {
+                    if (v) busy_ = false;                      // glitch, not a start bit
+                } else if (bit_ <= 8) {
+                    data_ |= static_cast<std::uint8_t>(v << (bit_ - 1));
+                } else {
+                    if (v) bytes.push_back(data_); else ++frame_errors;
+                    busy_ = false;
+                }
+                ++bit_;
+            }
+        }
+        prev_ = v;
+    }
+private:
+    double cpb_;
+    bool prev_ = true, busy_ = false;
+    std::uint64_t start_ = 0;
+    int bit_ = 0;
+    std::uint8_t data_ = 0;
+};
+
 struct Edges {
     std::uint64_t rises = 0, toggles = 0, last_rise = 0, min_period = ~0ull, max_period = 0;
     bool prev = false, init = false;
@@ -78,8 +112,8 @@ struct Edges {
 
 int main(int argc, char** argv) {
     Verilated::commandArgs(argc, argv);
-    if (argc < 4) {
-        std::fprintf(stderr, "usage: %s UART.txt FRAMES OUTDIR\n", argv[0]);
+    if (argc < 5) {
+        std::fprintf(stderr, "usage: %s UART.txt FRAMES OUTDIR BAUD\n", argv[0]);
         return 2;
     }
     std::vector<std::pair<std::uint64_t, int>> bytes;
@@ -94,6 +128,7 @@ int main(int argc, char** argv) {
     }
     const std::uint32_t total = static_cast<std::uint32_t>(std::strtoul(argv[2], nullptr, 10));
     const std::string out = argv[3];
+    const double baud = std::strtod(argv[4], nullptr);
 
     auto* top = new Vprimer25k_nanospc_top;
     top->midi_rx = 1;
@@ -112,7 +147,8 @@ int main(int argc, char** argv) {
     std::FILE* evlog = std::fopen((out + "/top_events.txt").c_str(), "w");
     std::uint64_t t = 0, run_clk = 0;
     std::size_t next_byte = 0;
-    const double cpb = CLK_HZ / BAUD;
+    const double cpb = CLK_HZ / baud;
+    UartModel pc(cpb);
 
     while (parallel.size() < total) {
         // Serial line: each byte is start bit, 8 data bits LSB first, stop bit.
@@ -152,6 +188,7 @@ int main(int argc, char** argv) {
             led.sample(l, t);
         }
         rx.sample(top->midi_rx, t);
+        pc.clock(top->uart_tx, t);
         prev_bclk = b; prev_lr = lr; prev_sd = sd; prev_led = l;
 
         if (top->sim_running && top->sim_snd_rdy) {
@@ -165,8 +202,15 @@ int main(int argc, char** argv) {
         const bool b = top->i2s_bclk;
         if (b && !prev_bclk) i2s.rising_edge(top->i2s_lrclk, top->i2s_sdata);
         prev_bclk = b;
+        pc.clock(top->uart_tx, ++t);
     }
     std::fclose(evlog);
+
+    // Raw bytes from uart_tx; check_top_midi.py decodes them (PCM14 or mu-law).
+    if (std::FILE* pb = std::fopen((out + "/top_pc_bytes.bin").c_str(), "wb")) {
+        std::fwrite(pc.bytes.data(), 1, pc.bytes.size(), pb);
+        std::fclose(pb);
+    }
 
     write_wav(out + "/top_midi.wav", parallel);
     write_wav(out + "/top_midi_i2s.wav", i2s.frames);
@@ -178,14 +222,16 @@ int main(int argc, char** argv) {
                  "bclk_rises %llu\nbclk_min_period %llu\nbclk_max_period %llu\n"
                  "lrclk_rises %llu\nlrclk_min_period %llu\nlrclk_max_period %llu\n"
                  "lr_sd_off_edge_changes %llu\nsdata_toggles %llu\nled_toggles %llu\n"
-                 "led_level_at_start %u\nmidi_rx_toggles %llu\n",
+                 "led_level_at_start %u\nmidi_rx_toggles %llu\n"
+                 "pc_bytes %zu\npc_frame_errors %d\npc_overrun %u\n",
                  parallel.size(), i2s.frames.size(), i2s_before_audio, next_byte,
                  top->sim_mb_sent, top->sim_mb_dropped, top->sim_mb_timeout, top->sim_mb_busy,
                  (unsigned long long)bclk.rises, (unsigned long long)bclk.min_period, (unsigned long long)bclk.max_period,
                  (unsigned long long)lrclk.rises, (unsigned long long)lrclk.min_period, (unsigned long long)lrclk.max_period,
                  (unsigned long long)lr_sd_violations, (unsigned long long)sdata.toggles, (unsigned long long)led.toggles,
                  static_cast<unsigned>(led_at_start),
-                 (unsigned long long)rx.toggles);
+                 (unsigned long long)rx.toggles,
+                 pc.bytes.size(), pc.frame_errors, top->sim_pc_overrun);
     std::FILE* lt = std::fopen((out + "/top_led.txt").c_str(), "w");
     for (std::uint64_t c : led_toggles) std::fprintf(lt, "%llu\n", (unsigned long long)c);
     std::fclose(lt);

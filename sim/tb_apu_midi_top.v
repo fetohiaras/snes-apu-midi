@@ -39,7 +39,15 @@ module tb_apu_midi_top #(
         .port_dout (port_dout),
         .snd_rdy   (snd_rdy),
         .audio_l   (audio_l),
-        .audio_r   (audio_r)
+        .audio_r   (audio_r),
+        .dbg_sum_a    (),
+        .dbg_sum_b    (),
+        .dbg_sum_done (),
+        .dbg_boot_pc  (),
+        .dbg_smp_a    (),
+        .dbg_page05   (),
+        .dbg_dsp_wr   (),
+        .dbg_kon_wr   ()
     );
 
     midi_mailbox u_mailbox (

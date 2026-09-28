@@ -21,7 +21,7 @@ import soundbank  # noqa: E402
 
 FS = soundbank.DSP_RATE
 CLOCKS_PER_SAMPLE = 768
-END = 5.25
+END = 5.6
 
 SCRIPT: list[tuple[float, int, int, int]] = [
     (0.10, 0xB0, 7, 100),                      # CC7 volume 100
@@ -160,8 +160,8 @@ def run_checks(a: Audio, summary: dict[str, int]) -> int:
 
     print("velocity")
     hi, lo = a.rms(1.45, 1.68), a.rms(1.85, 2.08)
-    # amp = vel * volume / 128 -> 99 for velocity 127, 31 for velocity 40
-    c.near(lo / hi, 31 / 99, 0.10, "velocity 40 vs 127 level ratio")
+    amp = lambda vel, vol: soundbank.velocity_curve(vel) * vol // 128   # as in the driver
+    c.near(lo / hi, amp(40, 100) / amp(127, 100), 0.10, "velocity 40 vs 127 level ratio (velocity curve)")
     c.check(a.rms(2.14, 2.19) < 0.01 * lo, "Note On velocity 0 releases", f"RMS {a.rms(2.14, 2.19):.1f}")
 
     print("pan")
@@ -180,8 +180,7 @@ def run_checks(a: Audio, summary: dict[str, int]) -> int:
 
     print("live volume (CC7 while a note is held)")
     before, after = a.rms(3.50, 3.68), a.rms(3.75, 3.95)
-    # amp 100*100/128 = 78 -> 100*30/128 = 23
-    c.near(after / before, 23 / 78, 0.10, "CC7 100 -> 30 level ratio")
+    c.near(after / before, amp(100, 30) / amp(100, 100), 0.10, "CC7 100 -> 30 level ratio")
 
     print("envelope: pluck instrument decays while held")
     early, late = a.rms(4.11, 4.16), a.rms(4.50, 4.58)

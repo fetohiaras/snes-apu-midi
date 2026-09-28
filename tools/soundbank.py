@@ -130,6 +130,17 @@ INSTRUMENTS = [
 ]
 
 
+# Velocity -> loudness. Square-root curve: moderate playing sounds louder
+# than a linear map (velocity 60 gives -3.3 dB instead of -6.5 dB) while
+# velocity 127 stays at full level.
+def velocity_curve(v: int) -> int:
+    return 0 if v <= 0 else max(1, min(127, round(127 * (v / 127) ** 0.5)))
+
+
+def velocity_table() -> bytes:
+    return bytes(velocity_curve(v) for v in range(128))
+
+
 def pitch_for_note(note: int, transpose: int = 0) -> int:
     """S-DSP PITCH register value that plays `note` from a REF_HZ cycle."""
     hz = 440.0 * 2 ** ((note + transpose - 69) / 12)

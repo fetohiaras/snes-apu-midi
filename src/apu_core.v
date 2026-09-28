@@ -26,7 +26,17 @@ module apu_core #(
 
     output wire        snd_rdy,
     output wire [15:0] audio_l,
-    output wire [15:0] audio_r
+    output wire [15:0] audio_r,
+
+    // Diagnostics (read-only taps, see primer25k_nanospc_top's diag packet)
+    output reg  [15:0] dbg_sum_a,       // Fletcher-16 style sums of the whole
+    output reg  [15:0] dbg_sum_b,       // A-RAM image, computed at boot
+    output reg         dbg_sum_done,
+    output reg  [15:0] dbg_boot_pc,     // PC loaded from the image header
+    output wire [15:0] dbg_smp_a,       // current SPC700 address
+    output reg  [15:0] dbg_page05,      // SPC700 bus cycles in page $05 (driver code)
+    output reg  [15:0] dbg_dsp_wr,      // SPC700 writes to $F3 (DSP data)
+    output reg  [7:0]  dbg_kon_wr       // ... of which to KON ($4C)
 );
 
     wire        smp_en;
@@ -60,7 +70,14 @@ module apu_core #(
     localparam [1:0] BOOT_RESET = 2'd0;
     localparam [1:0] BOOT_PARSE = 2'd1;
     localparam [1:0] BOOT_RUN   = 2'd2;
+    localparam [1:0] BOOT_SUM   = 2'd3;
     reg [1:0] boot_state = BOOT_RESET;
+
+    // Boot-time checksum of the whole image (header, A-RAM, DSP registers):
+    // proves on hardware that the block RAM was initialised from the file.
+    localparam [16:0] IMAGE_LAST = 17'd65919;
+    reg  [16:0] sum_addr;
+    reg         sum_rd, sum_valid, sum_last;
 
     initial running = 1'b0;
 
@@ -75,11 +92,16 @@ module apu_core #(
 
             case (boot_state)
                 BOOT_RESET: begin
-                    running      <= 1'b0;
-                    spc_reset    <= 1'b1;
-                    parser_start <= 1'b1;
-                    boot_state   <= BOOT_PARSE;
+                    running    <= 1'b0;
+                    spc_reset  <= 1'b1;
+                    boot_state <= BOOT_SUM;
                 end
+
+                BOOT_SUM:
+                    if (dbg_sum_done) begin
+                        parser_start <= 1'b1;
+                        boot_state   <= BOOT_PARSE;
+                    end
 
                 BOOT_PARSE: begin
                     // Release the APU reset. With running still low, debug
@@ -100,6 +122,65 @@ module apu_core #(
     end
 
     wire apu_resetn = resetn & ~spc_reset;
+
+    always @(posedge clk) begin
+        if (!resetn) begin
+            sum_addr     <= 17'd0;
+            sum_rd       <= 1'b0;
+            sum_valid    <= 1'b0;
+            sum_last     <= 1'b0;
+            dbg_sum_a    <= 16'd0;
+            dbg_sum_b    <= 16'd0;
+            dbg_sum_done <= 1'b0;
+        end else begin
+            // One read per clock; the RAM returns data one clock later.
+            sum_valid <= sum_rd;
+            sum_last  <= sum_rd && (sum_addr == IMAGE_LAST);
+            if (boot_state == BOOT_SUM && !dbg_sum_done && !sum_last) begin
+                if (!sum_rd) begin
+                    sum_rd <= 1'b1;
+                end else if (sum_addr == IMAGE_LAST) begin
+                    sum_rd <= 1'b0;
+                end else begin
+                    sum_addr <= sum_addr + 17'd1;
+                end
+            end
+            if (sum_valid) begin
+                dbg_sum_a <= dbg_sum_a + {8'd0, ram_dout};
+                dbg_sum_b <= dbg_sum_b + dbg_sum_a + {8'd0, ram_dout};
+            end
+            if (sum_last)
+                dbg_sum_done <= 1'b1;
+        end
+    end
+
+    // SPC700 bus taps
+    wire       smp_step = running & smp_en & dsp_last_phase;
+    reg  [7:0] dsp_addr_shadow;
+    assign dbg_smp_a = smp_a;
+
+    always @(posedge clk) begin
+        if (!resetn) begin
+            dbg_boot_pc     <= 16'd0;
+            dbg_page05      <= 16'd0;
+            dbg_dsp_wr      <= 16'd0;
+            dbg_kon_wr      <= 8'd0;
+            dsp_addr_shadow <= 8'd0;
+        end else begin
+            if (cpu_dbg_wr && smpcpu_dbg_reg == 8'd3) dbg_boot_pc[7:0]  <= smpcpu_dbg_din;
+            if (cpu_dbg_wr && smpcpu_dbg_reg == 8'd4) dbg_boot_pc[15:8] <= smpcpu_dbg_din;
+            if (smp_step) begin
+                if (smp_a[15:8] == 8'h05 && dbg_page05 != 16'hFFFF)
+                    dbg_page05 <= dbg_page05 + 16'd1;
+                if (!smp_we_n && smp_a == 16'h00F2)
+                    dsp_addr_shadow <= smp_do;
+                if (!smp_we_n && smp_a == 16'h00F3) begin
+                    if (dbg_dsp_wr != 16'hFFFF) dbg_dsp_wr <= dbg_dsp_wr + 16'd1;
+                    if (dsp_addr_shadow[6:0] == 7'h4C && dbg_kon_wr != 8'hFF) dbg_kon_wr <= dbg_kon_wr + 8'd1;
+                end
+            end
+        end
+    end
 
     SMP smp (
         .CLK             (clk),
@@ -160,9 +241,9 @@ module apu_core #(
         .dout   (ram_dout),
         .wr     (ram_wr),
         .a      (ram_a),
-        .spc_rd (parser_rd),
+        .spc_rd (parser_rd | sum_rd),
         .spc_wr (1'b0),
-        .spc_a  (parser_a),
+        .spc_a  (sum_rd ? sum_addr : parser_a),
         .length (),
         .fade   ()
     );

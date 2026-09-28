@@ -17,7 +17,7 @@ APU_RTL := \
 	../src/spc_core/spc700/spc700.v
 
 MIDI_IN_RTL := ../src/midi/uart_rx.v ../src/midi/midi_parser.v ../src/midi/midi_mailbox.v
-RTL := ../src/primer25k_nanospc_top.v ../src/i2s_tx.v $(MIDI_IN_RTL) $(APU_RTL)
+RTL := ../src/primer25k_nanospc_top.v ../src/i2s_tx.v ../src/pc_audio_tx.v ../src/diag_tx.v $(MIDI_IN_RTL) $(APU_RTL)
 
 .PHONY: build run test-i2s test-midi test-apu-midi test-top-midi midi-image spc-to-hex clean
 
@@ -82,22 +82,26 @@ midi-image: ../src/data/midi_boot.spc.hex
 # Full-chain integration: MIDI bytes on the midi_rx pin of the real top,
 # checked stage by stage (see check_top_midi.py).
 TOP_MIDI_DIR := obj_top_midi
+UART_BAUD    := 115200
+PC_FORMAT    := 1
+PC_DECIM     := 4
 
 $(TOP_MIDI_DIR)/V$(TOP): tb_top_midi.cpp $(RTL)
 	mkdir -p $(TOP_MIDI_DIR)
 	verilator --sv --top-module $(TOP) --cc --exe -O3 \
-		--Mdir $(TOP_MIDI_DIR) \
+		--Mdir $(TOP_MIDI_DIR) -GUART_BAUD=$(UART_BAUD) \
+		-GPC_AUDIO_FORMAT=$(PC_FORMAT) -GPC_AUDIO_DECIM=$(PC_DECIM) \
 		-I../src -I../src/spc_core -I../src/spc_core/spc700 \
 		$(RTL) tb_top_midi.cpp
 	$(MAKE) -C $(TOP_MIDI_DIR) -f V$(TOP).mk V$(TOP)
 
 test-top-midi: $(TOP_MIDI_DIR)/V$(TOP) $(APU_MIDI_DIR)/Vtb_apu_midi_top ../src/data/midi_boot.spc.hex
-	python3 check_top_midi.py stimulus $(MIDI_IMG_DIR) > $(MIDI_IMG_DIR)/top_frames.txt
+	python3 check_top_midi.py stimulus $(MIDI_IMG_DIR) $(UART_BAUD) > $(MIDI_IMG_DIR)/top_frames.txt
 	cd .. && sim/$(TOP_MIDI_DIR)/V$(TOP) sim/$(MIDI_IMG_DIR)/uart.txt \
-		$$(cat sim/$(MIDI_IMG_DIR)/top_frames.txt) sim/$(MIDI_IMG_DIR)
+		$$(cat sim/$(MIDI_IMG_DIR)/top_frames.txt) sim/$(MIDI_IMG_DIR) $(UART_BAUD)
 	$(APU_MIDI_DIR)/Vtb_apu_midi_top $(MIDI_IMG_DIR)/top_events.txt $$(cat $(MIDI_IMG_DIR)/top_frames.txt) \
 		$(MIDI_IMG_DIR)/ref.wav $(MIDI_IMG_DIR)/ref_summary.txt
-	python3 check_top_midi.py check $(MIDI_IMG_DIR)
+	python3 check_top_midi.py check $(MIDI_IMG_DIR) $(UART_BAUD) $(PC_FORMAT) $(PC_DECIM)
 
 $(BUILD_DIR)/V$(TOP): sim_main.cpp $(RTL)
 	mkdir -p $(BUILD_DIR)

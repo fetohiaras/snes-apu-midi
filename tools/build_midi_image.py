@@ -28,6 +28,7 @@ ENTRY = 0x0500          # `org` of the driver's reset label
 DIR_ADDR = 0x0200
 PITCH_ADDR = 0x0300
 INSTR_ADDR = 0x0400
+VEL_ADDR = 0x0480
 BRR_ADDR = 0x1000
 
 
@@ -50,6 +51,10 @@ def write_bank(build: Path, driver: Path) -> Path:
     for ins in soundbank.INSTRUMENTS:
         lines.append(f"    db {names.index(ins.wave)}, ${ins.adsr1:02X}, ${ins.adsr2:02X}, "
                      f"${ins.transpose & 0xFF:02X}  ; {ins.name}")
+    lines += ["", f"org ${VEL_ADDR:04X}", "velocity_table:  ; velocity -> level (soundbank.velocity_curve)"]
+    vt = soundbank.velocity_table()
+    for i in range(0, 128, 16):
+        lines.append("    db " + ", ".join(f"${v:02X}" for v in vt[i:i + 16]))
     lines += ["", f"org ${BRR_ADDR:04X}"]
     for n in names:
         (build / f"{n}.brr").write_bytes(soundbank.brr_encode(soundbank.WAVES[n], loop=True))

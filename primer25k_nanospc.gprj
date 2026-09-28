@@ -11,6 +11,8 @@
         <File path="src/primer25k_nanospc_top.v" type="file.verilog" enable="1"/>
         <File path="src/apu_core.v" type="file.verilog" enable="1"/>
         <File path="src/i2s_tx.v" type="file.verilog" enable="1"/>
+        <File path="src/pc_audio_tx.v" type="file.verilog" enable="1"/>
+        <File path="src/diag_tx.v" type="file.verilog" enable="1"/>
         <File path="src/midi/uart_rx.v" type="file.verilog" enable="1"/>
         <File path="src/midi/midi_parser.v" type="file.verilog" enable="1"/>
         <File path="src/midi/midi_mailbox.v" type="file.verilog" enable="1"/>

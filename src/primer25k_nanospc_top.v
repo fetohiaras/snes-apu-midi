@@ -2,17 +2,37 @@
 
 // SNES APU MIDI synthesizer for the Sipeed Tang Primer 25K.
 //
-//   midi_rx (31250 8N1) -> uart_rx -> midi_parser -> midi_mailbox
+//   midi_rx (UART 8N1) -> uart_rx -> midi_parser -> midi_mailbox
 //     -> APU I/O ports -> SPC700 MIDI driver -> S-DSP -> i2s_tx -> PCM5102A
+//                                                      \-> pc_audio_tx -> uart_tx
 //
 // BOOT_IMAGE is the A-RAM/register image the APU boots from; by default the
 // MIDI driver image built by tools/build_midi_image.py (see README).
+//
+// midi_rx/uart_tx are the dock's BL616 USB-serial link to the PC, shared by
+// MIDI in and (with PC_AUDIO) a mono audio stream out, so both run at
+// UART_BAUD. The BL616 bridge is only reliable at standard low rates, so the
+// default stream is 8-bit mu-law at fs/4 (7984 Hz), which fits 115200 baud;
+// PC_AUDIO_FORMAT = 0 (14-bit, full rate) needs a >= 800 kbaud link. For a
+// DIN-MIDI receiver use UART_BAUD = 31250 and PC_AUDIO = 0.
 module primer25k_nanospc_top #(
-    parameter         BOOT_IMAGE = "src/data/midi_boot.spc.hex",
-    parameter integer MIDI_BAUD  = 31250
+    parameter         BOOT_IMAGE      = "src/data/midi_boot.spc.hex",
+    parameter integer UART_BAUD       = 115200,
+    parameter integer PC_AUDIO        = 1,
+    parameter integer PC_AUDIO_FORMAT = 1,
+    parameter integer PC_AUDIO_DECIM  = 4,
+    // The BL616 bridge locks up if its ~7 KB receive buffer overflows while
+    // the PC is not reading, so audio is only streamed while Active Sensing
+    // bytes (0xFE, sent by the bridge script only while it reads the audio)
+    // keep arriving on midi_rx. Other MIDI traffic does not start it.
+    parameter integer PC_AUDIO_KEEPALIVE_MS = 300,
+    // Diagnostics: a 0xF9 byte on midi_rx (ignored by the MIDI parser)
+    // requests a status packet on uart_tx; see tools/midi_bridge.py --diag.
+    parameter integer DIAG = 1
 ) (
     input  wire clk_50m,
     input  wire midi_rx,
+    output wire uart_tx,
     output wire led_ready,
     // PCM5102A: SCK tied low (internal PLL), FMT low (I2S).
     output wire i2s_bclk,
@@ -33,6 +53,7 @@ module primer25k_nanospc_top #(
     ,output wire        sim_mb_dropped
     ,output wire        sim_mb_timeout
     ,output wire        sim_mb_busy
+    ,output wire        sim_pc_overrun
 `endif
 );
 
@@ -79,7 +100,7 @@ module primer25k_nanospc_top #(
     wire [6:0] ev_data1;
     wire [6:0] ev_data2;
 
-    uart_rx #(.CLK_HZ(DCLK_HZ), .BAUD(MIDI_BAUD)) midi_uart (
+    uart_rx #(.CLK_HZ(DCLK_HZ), .BAUD(UART_BAUD)) midi_uart (
         .clk       (dclk),
         .resetn    (resetn),
         .rx        (midi_rx),
@@ -149,7 +170,15 @@ module primer25k_nanospc_top #(
         .port_dout (port_dout),
         .snd_rdy   (snd_rdy),
         .audio_l   (audio_l),
-        .audio_r   (audio_r)
+        .audio_r   (audio_r),
+        .dbg_sum_a    (dbg_sum_a),
+        .dbg_sum_b    (dbg_sum_b),
+        .dbg_sum_done (dbg_sum_done),
+        .dbg_boot_pc  (dbg_boot_pc),
+        .dbg_smp_a    (dbg_smp_a),
+        .dbg_page05   (dbg_page05),
+        .dbg_dsp_wr   (dbg_dsp_wr),
+        .dbg_kon_wr   (dbg_kon_wr)
     );
 
     // ------------------------------------------------------------------------
@@ -169,15 +198,142 @@ module primer25k_nanospc_top #(
     );
 
     // ------------------------------------------------------------------------
-    // Status LED
+    // Audio to the PC over the USB-serial link
     // ------------------------------------------------------------------------
-    // Solid once the APU is running; after the first non-zero sample, bit 14
-    // of the sample counter blinks it at ~1 Hz. A mailbox error (driver not
-    // acknowledging, or command FIFO overflow) turns it off.
-    reg [14:0] sample_count = 15'd0;
-    reg        audio_seen = 1'b0;
+    wire pc_overrun;
+    wire pc_busy;
+    wire audio_tx;
+    wire diag_req = rx_valid && (rx_byte == 8'hF9);
+
+    localparam integer KEEPALIVE_CLKS = (DCLK_HZ / 1000) * PC_AUDIO_KEEPALIVE_MS;
+    localparam integer KA_W = $clog2(KEEPALIVE_CLKS + 1);
+    localparam [KA_W-1:0] KA_LOAD = KEEPALIVE_CLKS[KA_W-1:0];
+    reg [KA_W-1:0] pc_keepalive = {KA_W{1'b0}};
+    wire           pc_listening = (pc_keepalive != {KA_W{1'b0}});
 
     always @(posedge dclk) begin
+        if (!resetn)
+            pc_keepalive <= {KA_W{1'b0}};
+        else if (rx_valid && rx_byte == 8'hFE)
+            pc_keepalive <= KA_LOAD;
+        else if (pc_listening)
+            pc_keepalive <= pc_keepalive - 1'b1;
+    end
+
+    generate
+        if (PC_AUDIO != 0) begin : g_pc_audio
+            pc_audio_tx #(
+                .CLK_HZ(DCLK_HZ), .BAUD(UART_BAUD),
+                .FORMAT(PC_AUDIO_FORMAT), .DECIM(PC_AUDIO_DECIM)
+            ) pc_audio (
+                .clk          (dclk),
+                .resetn       (resetn),
+                .sample_valid (snd_rdy & apu_running & pc_listening),
+                .sample_l     (audio_l),
+                .sample_r     (audio_r),
+                .tx           (audio_tx),
+                .overrun      (pc_overrun),
+                .busy         (pc_busy)
+            );
+        end else begin : g_no_pc_audio
+            assign audio_tx   = 1'b1;
+            assign pc_overrun = 1'b0;
+            assign pc_busy    = 1'b0;
+        end
+    endgenerate
+
+    // ------------------------------------------------------------------------
+    // Diagnostic status packet (22 bytes, little-endian fields)
+    // ------------------------------------------------------------------------
+    //   0-1  A5 5A           magic
+    //   2-5  sum A, sum B    A-RAM image checksum computed at boot
+    //   6-7  boot PC         SPC700 PC loaded from the image header
+    //   8    flags           {sum_done, running, audio_seen, 0,
+    //                         mb_dropped, mb_timeout, pc_overrun, mb_busy}
+    //   9-10 mailbox sent    commands acknowledged by the driver
+    //   11   port 3          last value the SPC700 wrote to $F7 (its ack)
+    //   12-13 SPC700 address snapshot
+    //   14-15 SPC700 cycles in page $05 (driver code), saturating
+    //   16-17 SPC700 writes to $F3 (DSP data)
+    //   18   ... of which to KON ($4C)
+    //   19-20 peak |sample| of the APU output
+    //   21   XOR of bytes 0-20
+    reg [14:0] sample_count = 15'd0;
+    reg        audio_seen = 1'b0;
+    wire [15:0] dbg_sum_a, dbg_sum_b, dbg_boot_pc, dbg_smp_a, dbg_page05, dbg_dsp_wr;
+    wire [7:0]  dbg_kon_wr;
+    wire        dbg_sum_done;
+    wire        diag_tx_line;
+    wire        diag_busy;
+    reg         diag_pending = 1'b0;
+    reg         diag_start = 1'b0;
+    reg  [15:0] audio_peak = 16'd0;
+    reg  [8*22-1:0] diag_packet = {8*22{1'b0}};
+
+    wire [15:0] abs_l = audio_l[15] ? (~audio_l + 16'd1) : audio_l;
+    wire [15:0] abs_r = audio_r[15] ? (~audio_r + 16'd1) : audio_r;
+
+    wire [8*21-1:0] diag_body = {
+        audio_peak, dbg_kon_wr, dbg_dsp_wr, dbg_page05, dbg_smp_a, port_dout,
+        mb_sent, {dbg_sum_done, apu_running, audio_seen, 1'b0, mb_dropped, mb_timeout, pc_overrun, mb_busy},
+        dbg_boot_pc, dbg_sum_b, dbg_sum_a, 8'h5A, 8'hA5
+    };
+    reg  [7:0] diag_xor;
+    integer    di;
+    always @* begin
+        diag_xor = 8'h00;
+        for (di = 0; di < 21; di = di + 1)
+            diag_xor = diag_xor ^ diag_body[8*di +: 8];
+    end
+
+    always @(posedge dclk) begin
+        diag_start <= 1'b0;
+        if (!resetn) begin
+            diag_pending <= 1'b0;
+            audio_peak   <= 16'd0;
+        end else begin
+            if (apu_running && snd_rdy) begin
+                if (abs_l > audio_peak) audio_peak <= abs_l;
+                else if (abs_r > audio_peak) audio_peak <= abs_r;
+            end
+            if (DIAG != 0 && diag_req)
+                diag_pending <= 1'b1;
+            // Wait for the audio stream to go quiet, then snapshot and send.
+            if (diag_pending && !pc_listening && !pc_busy && !diag_busy) begin
+                diag_packet  <= {diag_xor, diag_body};
+                diag_start   <= 1'b1;
+                diag_pending <= 1'b0;
+            end
+        end
+    end
+
+    diag_tx #(.CLK_HZ(DCLK_HZ), .BAUD(UART_BAUD), .N(22)) diag (
+        .clk    (dclk),
+        .resetn (resetn),
+        .start  (diag_start),
+        .data   (diag_packet),
+        .tx     (diag_tx_line),
+        .busy   (diag_busy)
+    );
+
+    assign uart_tx = diag_busy ? diag_tx_line : audio_tx;
+
+    // ------------------------------------------------------------------------
+    // Status LED
+    // ------------------------------------------------------------------------
+    // Driven from the 50 MHz board clock so it can report a dead PLL too:
+    //   off          power-on reset
+    //   1 blink      dclk (PLL output) not running
+    //   2 blinks     dclk running, APU not started (boot/SPC parser stuck)
+    //   3 blinks     mailbox error (driver not acknowledging, command FIFO
+    //                overflow) or PC audio overrun
+    //   solid on     APU running, no audio yet
+    //   ~1 Hz blink  audio playing (bit 14 of the sample counter)
+    // Blink codes repeat every 2^27 board clocks (~2.7 s).
+    reg        dclk_toggle = 1'b0;
+
+    always @(posedge dclk) begin
+        dclk_toggle <= ~dclk_toggle;
         if (!apu_running) begin
             sample_count <= 15'd0;
             audio_seen   <= 1'b0;
@@ -188,11 +344,45 @@ module primer25k_nanospc_top #(
         end
     end
 
-    assign led_ready = !resetn                  ? 1'b0 :
-                       !apu_running             ? 1'b0 :
-                       (mb_timeout | mb_dropped) ? 1'b0 :
-                       !audio_seen              ? 1'b1 :
-                                                  sample_count[14];
+    wire error_flag = mb_timeout | mb_dropped | pc_overrun;
+
+    reg [2:0]  toggle_sync  = 3'b000;
+    reg [1:0]  running_sync = 2'b00;
+    reg [1:0]  audio_sync   = 2'b00;
+    reg [1:0]  error_sync   = 2'b00;
+    reg [1:0]  blink_sync   = 2'b00;
+    reg [9:0]  dclk_idle    = 10'h3FF;
+    reg [26:0] led_seq      = 27'd0;
+    reg        led_q        = 1'b0;
+
+    wire dclk_ok = (dclk_idle != 10'h3FF);
+    wire [1:0] blinks = !dclk_ok          ? 2'd1 :
+                        !running_sync[1]  ? 2'd2 :
+                        error_sync[1]     ? 2'd3 : 2'd0;
+    wire [3:0] slot = led_seq[26:23];
+
+    always @(posedge clk_50m) begin
+        toggle_sync  <= {toggle_sync[1:0], dclk_toggle};
+        running_sync <= {running_sync[0], apu_running};
+        audio_sync   <= {audio_sync[0], audio_seen};
+        error_sync   <= {error_sync[0], error_flag};
+        blink_sync   <= {blink_sync[0], sample_count[14]};
+        led_seq      <= led_seq + 27'd1;
+
+        if (toggle_sync[2] != toggle_sync[1])
+            dclk_idle <= 10'd0;
+        else if (dclk_ok)
+            dclk_idle <= dclk_idle + 10'd1;
+
+        if (!resetn)
+            led_q <= 1'b0;
+        else if (blinks != 2'd0)
+            led_q <= !slot[0] && (slot[3:1] < {1'b0, blinks});
+        else
+            led_q <= !audio_sync[1] ? 1'b1 : blink_sync[1];
+    end
+
+    assign led_ready = led_q;
 
 `ifdef VERILATOR
     assign sim_running    = apu_running;
@@ -207,6 +397,7 @@ module primer25k_nanospc_top #(
     assign sim_mb_dropped = mb_dropped;
     assign sim_mb_timeout = mb_timeout;
     assign sim_mb_busy    = mb_busy;
+    assign sim_pc_overrun = pc_overrun;
 `endif
 
 endmodule
