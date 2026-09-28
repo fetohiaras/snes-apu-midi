@@ -51,7 +51,9 @@ localparam [7:0] MUTE_MASK = 8'b0;
 reg RAM_WE; reg RAM_OE; reg RAM_CE;
 assign RAM_WR = RAM_WE & RAM_CE;
 
-reg [7:0] REGRAM[0:127] = '{128{8'b0}} /* synthesis syn_ramstyle = "distributed_ram" */;
+// Registers, not RAM: read combinationally and cleared on reset. The GW5A
+// has no distributed RAM, which the original attribute requested.
+reg [7:0] REGRAM[0:127] = '{128{8'b0}} /* synthesis syn_ramstyle = "registers" */;
 reg [7:0] RI;               // register value from SMP
 reg [6:0] REGN_RD, REGN_WR; // current register for read/write
 wire [6:0] REGS_ADDR_WR, REGS_ADDR_RD;
@@ -104,7 +106,8 @@ reg [15:0] BRR_ADDR[0:7];       // sample address for each channel
 reg [2:0] BRR_OFFS[0:7];
 reg [15:0] TBRRDAT;             // sample data (a pair of bytes)
 reg [7:0] TBRRHDR;              // sample header
-reg signed [15:0] BRR_BUF[0:7][0:11] /* synthesis syn_ramstyle = "distributed_ram" */;
+// Registers: a per-voice shift register read at four positions at once.
+reg signed [15:0] BRR_BUF[0:7][0:11] /* synthesis syn_ramstyle = "registers" */;
 
 reg [14:0] ECHO_POS;
 reg [14:0] ECHO_BUF[0:1][0:7];

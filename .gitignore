@@ -1,5 +1,6 @@
 # Gowin FPGA Designer generated implementation products
-**/impl/
+/impl/*
+!/impl/primer25k_nanospc_process_config.json
 **/temp/
 **/*.gprj.user
 **/*_tmp.v

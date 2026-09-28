@@ -87,7 +87,7 @@ module midi_mailbox #(
     // ------------------------------------------------------------------
     localparam integer DEPTH = 1 << FIFO_LOG2;
 
-    reg [23:0]        fifo [0:DEPTH-1];
+    reg [23:0]        fifo [0:DEPTH-1] /* synthesis syn_ramstyle = "registers" */;
     reg [FIFO_LOG2:0] wr_ptr, rd_ptr;
 
     wire fifo_empty = (wr_ptr == rd_ptr);

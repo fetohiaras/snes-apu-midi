@@ -21,6 +21,18 @@ código-fonte:
 - uma variável temporária procedural foi transformada em `wire` para ser
   aceita pelas versões atuais do Verilator.
 
+Modificações para síntese no GW5A-25 (que não tem RAM distribuída):
+
+- `spc700/mcode.v`: a ROM de microcódigo `M_TAB` é inferida como BSRAM (pROM),
+  cujo registrador de saída só pode ser zerado no reset. O valor de reset do
+  micro-instrução (passo 0 do NOP, `PC++`) não é zero; ele passou a ser
+  aplicado por um multiplexador fora da ROM (`MI_RESET`/`MI_VALID`), com o
+  mesmo comportamento ciclo a ciclo. Sem isso, no hardware, a primeira busca
+  de opcode depois do reset não incrementa o PC e a CPU executa código errado.
+- `dsp.v`: `REGRAM` e `BRR_BUF` pediam `distributed_ram`; agora são marcados
+  explicitamente como registradores.
+- `test_aram.v`: a A-RAM é marcada explicitamente como BSRAM.
+
 A cópia exata do núcleo é versionada neste repositório, em vez de ser obtida
 por meio de um submódulo. Assim, um clone é autocontido e reproduzível. O
 NanoSPC é uma referência upstream, e não um checkout exigido por este build.

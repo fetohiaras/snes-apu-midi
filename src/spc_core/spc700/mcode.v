@@ -4367,7 +4367,7 @@ localparam MicroInst_r M_TAB[0:4095] = '{
 	{2'bXX,2'bXX,6'bXXXXXX,5'bXXXXX,2'bXX,5'bXXXXX,6'bXXXXXX,3'bXXX},
 	{2'bXX,2'bXX,6'bXXXXXX,5'bXXXXX,2'bXX,5'bXXXXX,6'bXXXXXX,3'bXXX},
 	{2'bXX,2'bXX,6'bXXXXXX,5'bXXXXX,2'bXX,5'bXXXXX,6'bXXXXXX,3'bXXX}    
-} /* synthesis syn_ramstyle = "distributed_ram" */;
+} /* synthesis syn_romstyle = "block_rom" */;
 
 localparam ALUCtrl_r ALU_TAB[0:33] = '{
 	{3'b110,4'b0011,1'b0,1'b0,1'b0},// 000000 LOAD
@@ -4432,16 +4432,30 @@ MicroInst_r MI;
 ALUCtrl_r ALUFlags;
 RegCtrl_r R;
 
+// M_TAB maps to block ROM, whose output register (MI_ROM) can only reset to
+// zero. The reset micro-instruction (NOP step 0: PC++) is non-zero, so it is
+// applied with a mux instead; otherwise the first opcode fetch after reset
+// skips PC++ and the CPU misreads its entry code (on hardware only).
+localparam MicroInst_r MI_RESET = {2'b0, 2'b0, 6'b0, 5'b1, 2'b0, 5'b0, 6'b0, 3'b0};
+MicroInst_r MI_ROM;
+reg MI_VALID;
+
 assign ALUFlags = ALU_TAB[MI.ALUCtrl];
 assign R = REG_TAB[MI.regMode];
 
 always @(posedge CLK) begin
-    if (~RST_N)
-        MI <= {2'b0, 2'b0, 6'b0, 5'b1, 2'b0, 5'b0, 6'b0, 3'b0};
-    else 
-        if (EN)
-            MI <= M_TAB[{IR, STATE}];
+    if (EN)
+        MI_ROM <= M_TAB[{IR, STATE}];
 end
+
+always @(posedge CLK) begin
+    if (~RST_N)
+        MI_VALID <= 1'b0;
+    else if (EN)
+        MI_VALID <= 1'b1;
+end
+
+assign MI = MI_VALID ? MI_ROM : MI_RESET;
 
 assign M = {ALUFlags, 
             MI.stateCtrl, 

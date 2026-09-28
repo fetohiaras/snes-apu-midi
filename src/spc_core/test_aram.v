@@ -23,7 +23,9 @@ module test_aram #(
     output [15:0] fade      // binary in msec
 );
 
-reg [7:0] mem [0:256 + 65536 + 128 - 1];    // 256B of header + 64KB of ARAM + 127B of DSP ram
+// Block RAM (single port, synchronous read, write leaves dout unchanged:
+// BSRAM "normal" write mode), initialised from MEM_INIT_FILE.
+reg [7:0] mem [0:256 + 65536 + 128 - 1] /* synthesis syn_ramstyle = "block_ram" */;    // 256B of header + 64KB of ARAM + 127B of DSP ram
 wire [16:0] addr = (spc_rd | spc_wr) ? spc_a : 17'(a) + 17'h100;
 wire write = wr | spc_wr;
 
