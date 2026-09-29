@@ -16,6 +16,10 @@
         <File path="src/midi/uart_rx.v" type="file.verilog" enable="1"/>
         <File path="src/midi/midi_parser.v" type="file.verilog" enable="1"/>
         <File path="src/midi/midi_mailbox.v" type="file.verilog" enable="1"/>
+        <File path="src/usb/gowin_pll_usb60.v" type="file.verilog" enable="1"/>
+        <File path="src/usb/usb_hid_note_bridge.v" type="file.verilog" enable="1"/>
+        <File path="src/usb/third_party/usb_hid_host.v" type="file.verilog" enable="1"/>
+        <File path="src/usb/third_party/usb_hid_host_rom.v" type="file.verilog" enable="1"/>
         <File path="src/spc_core/dsp.v" type="file.verilog" enable="1"/>
         <File path="src/spc_core/smp.v" type="file.verilog" enable="1"/>
         <File path="src/spc_core/spc700/_spc700_package.v" type="file.verilog" enable="1"/>

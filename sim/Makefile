@@ -17,7 +17,9 @@ APU_RTL := \
 	../src/spc_core/spc700/spc700.v
 
 MIDI_IN_RTL := ../src/midi/uart_rx.v ../src/midi/midi_parser.v ../src/midi/midi_mailbox.v
-RTL := ../src/primer25k_nanospc_top.v ../src/i2s_tx.v ../src/pc_audio_tx.v ../src/diag_tx.v $(MIDI_IN_RTL) $(APU_RTL)
+USB_RTL := ../src/usb/gowin_pll_usb60.v ../src/usb/usb_hid_note_bridge.v \
+	../src/usb/third_party/usb_hid_host.v ../src/usb/third_party/usb_hid_host_rom.v
+RTL := ../src/primer25k_nanospc_top.v ../src/i2s_tx.v ../src/pc_audio_tx.v ../src/diag_tx.v $(MIDI_IN_RTL) $(USB_RTL) $(APU_RTL)
 
 .PHONY: build run test-i2s test-midi test-apu-midi test-top-midi midi-image spc-to-hex clean
 

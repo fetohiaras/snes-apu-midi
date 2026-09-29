@@ -6,6 +6,12 @@
 //     -> APU I/O ports -> SPC700 MIDI driver -> S-DSP -> i2s_tx -> PCM5102A
 //                                                      \-> pc_audio_tx -> uart_tx
 //
+// usb_dp/usb_dm (USB-A, banco 7) -> nucleo USB HID Host de terceiros
+//   (src/usb/third_party, m1nl/usb_hid_host, Low-/Full-Speed automatico) ->
+//   adaptador usb_hid_note_bridge -> mesmos eventos ev_valid/ev_status/
+//   ev_data1/ev_data2 do midi_parser, somados apos o parser (teclado USB
+//   sem PC, em paralelo ao caminho MIDI/UART existente, que nao e alterado).
+//
 // BOOT_IMAGE is the A-RAM/register image the APU boots from; by default the
 // MIDI driver image built by tools/build_midi_image.py (see README).
 //
@@ -34,6 +40,8 @@ module primer25k_nanospc_top #(
     input  wire midi_rx,
     output wire uart_tx,
     output wire led_ready,
+    inout  wire usb_dp,
+    inout  wire usb_dm,
     // PCM5102A: SCK tied low (internal PLL), FMT low (I2S).
     output wire i2s_bclk,
     output wire i2s_lrclk,
@@ -109,6 +117,8 @@ module primer25k_nanospc_top #(
         .frame_err ()
     );
 
+    // Caminho MIDI/UART existente, inalterado: o parser continua ligado
+    // apenas a uart_rx.
     midi_parser parser (
         .clk       (dclk),
         .resetn    (resetn),
@@ -119,6 +129,116 @@ module primer25k_nanospc_top #(
         .ev_data1  (ev_data1),
         .ev_data2  (ev_data2)
     );
+
+    // ------------------------------------------------------------------------
+    // USB HID Host (teclado no USB-A): nucleo de terceiros m1nl/usb_hid_host
+    // (src/usb/third_party, inalterado) em clk_usb=60MHz gerado por PLL
+    // dedicado a partir de clk_50m, com negociacao automatica Low-/Full-
+    // Speed. usb_hid_note_bridge converte os relatorios de teclado na MESMA
+    // interface de eventos do parser MIDI (ev_valid/ev_status/ev_data1/
+    // ev_data2), cruzando para dclk com sincronizadores de 2 flip-flops.
+    // ------------------------------------------------------------------------
+    wire clk_usb;
+    wire pll_usb_lock;
+
+`ifdef VERILATOR
+    assign clk_usb      = clk_50m;
+    assign pll_usb_lock = 1'b1;
+`else
+    gowin_pll_usb60 u_pll_usb (
+        .clkin (clk_50m),
+        .clkout(clk_usb),
+        .lock  (pll_usb_lock)
+    );
+`endif
+
+    wire        usb_dp_i, usb_dm_i, usb_dp_o, usb_dm_o, usb_oe;
+    wire [1:0]  usb_hid_typ;
+    wire        usb_hid_full_report;
+    wire        usb_hid_connerr, usb_hid_busy;
+    wire [7:0]  usb_hid_key_mod;
+    wire [7:0]  usb_hid_key0, usb_hid_key1, usb_hid_key2;
+    wire [7:0]  usb_hid_key3, usb_hid_key4, usb_hid_key5;
+    wire [9:0]  usb_rom_addr;
+    wire [3:0]  usb_rom_dout;
+    wire        usb_rom_en;
+
+    assign usb_dp    = usb_oe ? usb_dp_o : 1'bz;
+    assign usb_dm    = usb_oe ? usb_dm_o : 1'bz;
+    assign usb_dp_i  = usb_dp;
+    assign usb_dm_i  = usb_dm;
+
+    // Codigo microprogramado do host (terceiros, ROM inicializada por
+    // usb_hid_host_rom.mem na raiz do projeto).
+    usb_hid_host_rom u_usb_hid_rom (
+        .clk  (clk_usb),
+        .addr (usb_rom_addr),
+        .dout (usb_rom_dout),
+        .en   (usb_rom_en)
+    );
+
+    usb_hid_host u_usb_hid_host (
+        .clk          (clk_usb),
+        .reset        (~pll_usb_lock),
+        .cs           (1'b1),
+        .usb_dp_i     (usb_dp_i),
+        .usb_dm_i     (usb_dm_i),
+        .usb_dp_o     (usb_dp_o),
+        .usb_dm_o     (usb_dm_o),
+        .usb_oe       (usb_oe),
+        .typ          (usb_hid_typ),
+        .full_report  (usb_hid_full_report),
+        .connerr      (usb_hid_connerr),
+        .busy         (usb_hid_busy),
+        .key_modifiers(usb_hid_key_mod),
+        .key_0        (usb_hid_key0),
+        .key_1        (usb_hid_key1),
+        .key_2        (usb_hid_key2),
+        .key_3        (usb_hid_key3),
+        .key_4        (usb_hid_key4),
+        .key_5        (usb_hid_key5),
+        .mouse_btn    (),
+        .mouse_dx     (),
+        .mouse_dy     (),
+        .game_l       (), .game_r  (), .game_u  (), .game_d  (),
+        .game_a       (), .game_b  (), .game_x  (), .game_y  (),
+        .game_sel     (), .game_sta(), .game_extra(),
+        .dbg_hid_report(), .dbg_hid_regs(),
+        .rom_addr     (usb_rom_addr),
+        .rom_dout     (usb_rom_dout),
+        .rom_en       (usb_rom_en)
+    );
+
+    wire       usb_ev_valid;
+    wire [7:0] usb_ev_status;
+    wire [6:0] usb_ev_data1;
+    wire [6:0] usb_ev_data2;
+
+    usb_hid_note_bridge u_usb_hid_note_bridge (
+        .clk_usb      (clk_usb),
+        .resetn_usb   (pll_usb_lock),
+        .typ          (usb_hid_typ),
+        .full_report  (usb_hid_full_report),
+        .key_0        (usb_hid_key0),
+        .key_1        (usb_hid_key1),
+        .key_2        (usb_hid_key2),
+        .key_3        (usb_hid_key3),
+        .key_4        (usb_hid_key4),
+        .key_5        (usb_hid_key5),
+        .clk          (dclk),
+        .resetn       (resetn),
+        .ev_valid     (usb_ev_valid),
+        .ev_status    (usb_ev_status),
+        .ev_data1     (usb_ev_data1),
+        .ev_data2     (usb_ev_data2)
+    );
+
+    // Arbitragem minima: MIDI/UART tem prioridade (caminho existente,
+    // inalterado), depois teclado USB HID.
+    wire       mb_ev_valid  = ev_valid  | usb_ev_valid;
+    wire [7:0] mb_ev_status = ev_valid  ? ev_status : usb_ev_status;
+    wire [6:0] mb_ev_data1  = ev_valid  ? ev_data1  : usb_ev_data1;
+    wire [6:0] mb_ev_data2  = ev_valid  ? ev_data2  : usb_ev_data2;
 
     // ------------------------------------------------------------------------
     // Mailbox -> APU
@@ -138,10 +258,10 @@ module primer25k_nanospc_top #(
         .clk         (dclk),
         .resetn      (resetn),
         .apu_running (apu_running),
-        .ev_valid    (ev_valid),
-        .ev_status   (ev_status),
-        .ev_data1    (ev_data1),
-        .ev_data2    (ev_data2),
+        .ev_valid    (mb_ev_valid),
+        .ev_status   (mb_ev_status),
+        .ev_data1    (mb_ev_data1),
+        .ev_data2    (mb_ev_data2),
         .port_a      (port_a),
         .port_wr_n   (port_wr_n),
         .port_cs     (port_cs),
@@ -316,6 +436,9 @@ module primer25k_nanospc_top #(
         .busy   (diag_busy)
     );
 
+    // Pacote de diagnostico do host USB (antigo, dependia dos contadores do
+    // host USB-MIDI proprio removido nesta integracao) foi retirado; o
+    // caminho de diagnostico/UART existente permanece como antes.
     assign uart_tx = diag_busy ? diag_tx_line : audio_tx;
 
     // ------------------------------------------------------------------------

@@ -27,3 +27,12 @@ IO_LOC "i2s_sdata" D11;
 IO_PORT "i2s_bclk"  IO_TYPE=LVCMOS33 PULL_MODE=NONE DRIVE=8 BANK_VCCIO=3.3;
 IO_PORT "i2s_lrclk" IO_TYPE=LVCMOS33 PULL_MODE=NONE DRIVE=8 BANK_VCCIO=3.3;
 IO_PORT "i2s_sdata" IO_TYPE=LVCMOS33 PULL_MODE=NONE DRIVE=8 BANK_VCCIO=3.3;
+
+// USB-A (ligado direto a FPGA, banco 7), host Low-/Full-Speed automatico:
+// pull-down em D+ e D- para SE0/idle de host ate o nucleo usb_hid_host
+// assumir a linha (usb_oe).
+IO_LOC "usb_dp" L6;
+IO_LOC "usb_dm" K6;
+IO_PORT "usb_dp" IO_TYPE=LVCMOS33 PULL_MODE=DOWN BANK_VCCIO=3.3;
+IO_PORT "usb_dm" IO_TYPE=LVCMOS33 PULL_MODE=DOWN BANK_VCCIO=3.3;
+
