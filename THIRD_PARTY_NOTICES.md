@@ -1,5 +1,20 @@
 # Avisos de terceiros e proveniência
 
+## Núcleos USB da ultraembedded
+
+Os arquivos em `src/usb/` (exceto `usb_host_probe.v` e `usb_midi_fifo.v`,
+escritos para este projeto) são cópias sem modificação de:
+
+- [ultraembedded/core_usb_fs_phy](https://github.com/ultraembedded/core_usb_fs_phy),
+  commit `68a63ff937e58e90f4f534b9c6705c649d545136`: `usb_fs_phy.v`
+  (LGPL-2.1 ou posterior). O `usb_transceiver.v` do mesmo projeto não é
+  usado; o equivalente ao seu modo 1 (acionamento direto de D+/D−) está no
+  topo.
+- [ultraembedded/core_usb_host](https://github.com/ultraembedded/core_usb_host),
+  commit `81eb9f131dbb434a9047ae074fea5c31ef46ce5d`: `usbh_sie.v`,
+  `usbh_crc5.v`, `usbh_crc16.v` (GPL-3.0). O restante do controlador
+  (`usbh_host.v`, registradores AXI e FIFOs) não é usado.
+
 ## Núcleo APU do NanoSPC
 
 Os arquivos em `src/spc_core/` são derivados de

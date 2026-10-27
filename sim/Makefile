@@ -17,9 +17,11 @@ APU_RTL := \
 	../src/spc_core/spc700/spc700.v
 
 MIDI_IN_RTL := ../src/midi/uart_rx.v ../src/midi/midi_parser.v ../src/midi/midi_mailbox.v
-RTL := ../src/primer25k_nanospc_top.v ../src/i2s_tx.v ../src/pc_audio_tx.v ../src/diag_tx.v $(MIDI_IN_RTL) $(APU_RTL)
+USB_RTL := ../src/usb/usb_host_probe.v ../src/usb/usbh_sie.v ../src/usb/usbh_crc5.v \
+	../src/usb/usbh_crc16.v ../src/usb/usb_fs_phy.v ../src/usb/usb_midi_fifo.v
+RTL := ../src/primer25k_nanospc_top.v ../src/i2s_tx.v ../src/pc_audio_tx.v ../src/diag_tx.v $(MIDI_IN_RTL) $(APU_RTL) $(USB_RTL)
 
-.PHONY: build run test-i2s test-midi test-apu-midi test-top-midi midi-image spc-to-hex clean
+.PHONY: build run test-i2s test-midi test-usb test-apu-midi test-top-midi test-top-usb midi-image spc-to-hex clean
 
 build: $(BUILD_DIR)/V$(TOP)
 
@@ -45,6 +47,18 @@ $(MIDI_DIR)/Vtb_midi_top: tb_midi.cpp $(MIDI_RTL)
 
 test-midi: $(MIDI_DIR)/Vtb_midi_top
 	$(MIDI_DIR)/Vtb_midi_top
+
+# USB host probe + PHY against the behavioural device in usb_device_model.h.
+USB_DIR := obj_usb
+
+$(USB_DIR)/Vtb_usb_host_top: tb_usb_host.cpp usb_device_model.h tb_usb_host_top.v $(USB_RTL)
+	mkdir -p $(USB_DIR)
+	verilator --sv --top-module tb_usb_host_top --cc --exe -O3 -Wno-fatal \
+		--Mdir $(USB_DIR) tb_usb_host_top.v $(USB_RTL) tb_usb_host.cpp
+	$(MAKE) -C $(USB_DIR) -f Vtb_usb_host_top.mk Vtb_usb_host_top
+
+test-usb: $(USB_DIR)/Vtb_usb_host_top
+	$(USB_DIR)/Vtb_usb_host_top
 
 # End-to-end MIDI test: builds the SPC700 driver image (needs spcasm; set
 # SPCASM=/path/to/spcasm if it is not on PATH), plays check_apu_midi.py's
@@ -89,7 +103,7 @@ PC_DECIM     := 4
 $(TOP_MIDI_DIR)/V$(TOP): tb_top_midi.cpp $(RTL)
 	mkdir -p $(TOP_MIDI_DIR)
 	verilator --sv --top-module $(TOP) --cc --exe -O3 \
-		--Mdir $(TOP_MIDI_DIR) -GUART_BAUD=$(UART_BAUD) \
+		--Mdir $(TOP_MIDI_DIR) -GUART_BAUD=$(UART_BAUD) -GUSB_HOST=0 -Wno-fatal \
 		-GPC_AUDIO_FORMAT=$(PC_FORMAT) -GPC_AUDIO_DECIM=$(PC_DECIM) \
 		-I../src -I../src/spc_core -I../src/spc_core/spc700 \
 		$(RTL) tb_top_midi.cpp
@@ -103,10 +117,25 @@ test-top-midi: $(TOP_MIDI_DIR)/V$(TOP) $(APU_MIDI_DIR)/Vtb_apu_midi_top ../src/d
 		$(MIDI_IMG_DIR)/ref.wav $(MIDI_IMG_DIR)/ref_summary.txt
 	python3 check_top_midi.py check $(MIDI_IMG_DIR) $(UART_BAUD) $(PC_FORMAT) $(PC_DECIM)
 
+# Full top with USB_HOST = 1: the device model on the USB pins, then the
+# 0xFD (USB) and 0xF9 (main) status packets requested over midi_rx.
+TOP_USB_DIR := obj_top_usb
+
+$(TOP_USB_DIR)/V$(TOP): tb_top_usb.cpp usb_device_model.h $(RTL)
+	mkdir -p $(TOP_USB_DIR)
+	verilator --sv --top-module $(TOP) --cc --exe -O3 -Wno-fatal \
+		--Mdir $(TOP_USB_DIR) -GUART_BAUD=$(UART_BAUD) -GUSB_HOST=1 \
+		-I../src -I../src/spc_core -I../src/spc_core/spc700 \
+		$(RTL) tb_top_usb.cpp
+	$(MAKE) -C $(TOP_USB_DIR) -f V$(TOP).mk V$(TOP)
+
+test-top-usb: $(TOP_USB_DIR)/V$(TOP) ../src/data/midi_boot.spc.hex
+	cd .. && sim/$(TOP_USB_DIR)/V$(TOP) $(UART_BAUD)
+
 $(BUILD_DIR)/V$(TOP): sim_main.cpp $(RTL)
 	mkdir -p $(BUILD_DIR)
 	verilator --sv --top-module $(TOP) --trace --cc --exe -O3 \
-		--Mdir $(BUILD_DIR) \
+		--Mdir $(BUILD_DIR) -GUSB_HOST=0 -Wno-fatal \
 		'-GBOOT_IMAGE="src/data/test_spc.spc.hex"' \
 		-I../src -I../src/spc_core -I../src/spc_core/spc700 \
 		$(RTL) sim_main.cpp
@@ -129,4 +158,4 @@ spc-to-hex:
 	python3 ../tools/spc_to_hex.py "$(SPC)" "$(HEX)"
 
 clean:
-	rm -rf $(BUILD_DIR) $(I2S_DIR) $(MIDI_DIR) $(APU_MIDI_DIR) $(TOP_MIDI_DIR) $(MIDI_IMG_DIR) output
+	rm -rf $(BUILD_DIR) $(I2S_DIR) $(MIDI_DIR) $(USB_DIR) $(APU_MIDI_DIR) $(TOP_MIDI_DIR) $(TOP_USB_DIR) $(MIDI_IMG_DIR) output
