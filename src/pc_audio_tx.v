@@ -21,7 +21,7 @@ module pc_audio_tx #(
     input  wire        sample_valid,
     input  wire [15:0] sample_l,
     input  wire [15:0] sample_r,
-    output reg         tx,
+    output reg         tx = 1'b1,
     output reg         overrun,
     output wire        busy
 );
