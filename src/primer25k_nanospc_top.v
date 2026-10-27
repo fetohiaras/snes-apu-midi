@@ -131,12 +131,19 @@ module primer25k_nanospc_top #(
     );
 
     // ------------------------------------------------------------------------
-    // USB HID Host (teclado no USB-A): nucleo de terceiros m1nl/usb_hid_host
-    // (src/usb/third_party, inalterado) em clk_usb=60MHz gerado por PLL
-    // dedicado a partir de clk_50m, com negociacao automatica Low-/Full-
-    // Speed. usb_hid_note_bridge converte os relatorios de teclado na MESMA
-    // interface de eventos do parser MIDI (ev_valid/ev_status/ev_data1/
-    // ev_data2), cruzando para dclk com sincronizadores de 2 flip-flops.
+    // USB MIDI Host (teclado MIDI classe Audio/MIDIStreaming no USB-A):
+    // host nativo src/usb_midi/ (soft PHY bit-a-bit, sem PHY de hardware),
+    // em clk_usb=60MHz gerado pelo MESMO PLL dedicado que o host HID
+    // anterior usava (src/usb/gowin_pll_usb60.v, reaproveitado sem
+    // alteracao, pois os temporizadores do host MIDI ja assumem 60 MHz
+    // -- ver DESC_LAB3.md secao 8/9). usb_midi_top entrega os eventos na
+    // MESMA interface ev_valid/ev_status/ev_data1/ev_data2 que o host HID
+    // entregava, cruzando para dclk internamente; por isso a arbitragem
+    // com o midi_parser da UART, logo abaixo, nao precisa mudar.
+    //
+    // Esta troca substitui o host HID (src/usb/third_party/usb_hid_host.v)
+    // porque os dois disputariam o mesmo par de pinos usb_dp/usb_dm -- ver
+    // DESC_LAB3.md secao 9, item 2 ("Trocar o host", opcao recomendada).
     // ------------------------------------------------------------------------
     wire clk_usb;
     wire pll_usb_lock;
@@ -152,85 +159,36 @@ module primer25k_nanospc_top #(
     );
 `endif
 
-    wire        usb_dp_i, usb_dm_i, usb_dp_o, usb_dm_o, usb_oe;
-    wire [1:0]  usb_hid_typ;
-    wire        usb_hid_full_report;
-    wire        usb_hid_connerr, usb_hid_busy;
-    wire [7:0]  usb_hid_key_mod;
-    wire [7:0]  usb_hid_key0, usb_hid_key1, usb_hid_key2;
-    wire [7:0]  usb_hid_key3, usb_hid_key4, usb_hid_key5;
-    wire [9:0]  usb_rom_addr;
-    wire [3:0]  usb_rom_dout;
-    wire        usb_rom_en;
-
-    assign usb_dp    = usb_oe ? usb_dp_o : 1'bz;
-    assign usb_dm    = usb_oe ? usb_dm_o : 1'bz;
-    assign usb_dp_i  = usb_dp;
-    assign usb_dm_i  = usb_dm;
-
-    // Codigo microprogramado do host (terceiros, ROM inicializada por
-    // usb_hid_host_rom.mem na raiz do projeto).
-    usb_hid_host_rom u_usb_hid_rom (
-        .clk  (clk_usb),
-        .addr (usb_rom_addr),
-        .dout (usb_rom_dout),
-        .en   (usb_rom_en)
-    );
-
-    usb_hid_host u_usb_hid_host (
-        .clk          (clk_usb),
-        .reset        (~pll_usb_lock),
-        .cs           (1'b1),
-        .usb_dp_i     (usb_dp_i),
-        .usb_dm_i     (usb_dm_i),
-        .usb_dp_o     (usb_dp_o),
-        .usb_dm_o     (usb_dm_o),
-        .usb_oe       (usb_oe),
-        .typ          (usb_hid_typ),
-        .full_report  (usb_hid_full_report),
-        .connerr      (usb_hid_connerr),
-        .busy         (usb_hid_busy),
-        .key_modifiers(usb_hid_key_mod),
-        .key_0        (usb_hid_key0),
-        .key_1        (usb_hid_key1),
-        .key_2        (usb_hid_key2),
-        .key_3        (usb_hid_key3),
-        .key_4        (usb_hid_key4),
-        .key_5        (usb_hid_key5),
-        .mouse_btn    (),
-        .mouse_dx     (),
-        .mouse_dy     (),
-        .game_l       (), .game_r  (), .game_u  (), .game_d  (),
-        .game_a       (), .game_b  (), .game_x  (), .game_y  (),
-        .game_sel     (), .game_sta(), .game_extra(),
-        .dbg_hid_report(), .dbg_hid_regs(),
-        .rom_addr     (usb_rom_addr),
-        .rom_dout     (usb_rom_dout),
-        .rom_en       (usb_rom_en)
-    );
-
     wire       usb_ev_valid;
     wire [7:0] usb_ev_status;
     wire [6:0] usb_ev_data1;
     wire [6:0] usb_ev_data2;
 
-    usb_hid_note_bridge u_usb_hid_note_bridge (
-        .clk_usb      (clk_usb),
-        .resetn_usb   (pll_usb_lock),
-        .typ          (usb_hid_typ),
-        .full_report  (usb_hid_full_report),
-        .key_0        (usb_hid_key0),
-        .key_1        (usb_hid_key1),
-        .key_2        (usb_hid_key2),
-        .key_3        (usb_hid_key3),
-        .key_4        (usb_hid_key4),
-        .key_5        (usb_hid_key5),
-        .clk          (dclk),
-        .resetn       (resetn),
-        .ev_valid     (usb_ev_valid),
-        .ev_status    (usb_ev_status),
-        .ev_data1     (usb_ev_data1),
-        .ev_data2     (usb_ev_data2)
+    // Diagnostico de bring-up (sem PC): nenhum LED/pino sobressalente
+    // confirmado nesta placa/dock alem de led_ready (ja usado pelo status
+    // do APU), entao estes sinais ficam apenas disponiveis para quem quiser
+    // ligar a um LED ou UART de depuracao depois -- ver DESC_LAB3.md secao
+    // 9, item 5.
+    wire        usb_midi_dev_configured;
+    wire        usb_midi_dev_error;
+    wire [15:0] usb_midi_poll_count;
+    wire [15:0] usb_midi_nak_count;
+
+    usb_midi_top u_usb_midi_top (
+        .clk_usb       (clk_usb),
+        .resetn_usb    (pll_usb_lock),
+        .usb_dp        (usb_dp),
+        .usb_dm        (usb_dm),
+        .clk           (dclk),
+        .resetn        (resetn),
+        .ev_valid      (usb_ev_valid),
+        .ev_status     (usb_ev_status),
+        .ev_data1      (usb_ev_data1),
+        .ev_data2      (usb_ev_data2),
+        .dev_configured(usb_midi_dev_configured),
+        .dev_error     (usb_midi_dev_error),
+        .poll_count    (usb_midi_poll_count),
+        .nak_count     (usb_midi_nak_count)
     );
 
     // Arbitragem minima: MIDI/UART tem prioridade (caminho existente,
@@ -363,7 +321,7 @@ module primer25k_nanospc_top #(
     endgenerate
 
     // ------------------------------------------------------------------------
-    // Diagnostic status packet (22 bytes, little-endian fields)
+    // Diagnostic status packet (27 bytes, little-endian fields)
     // ------------------------------------------------------------------------
     //   0-1  A5 5A           magic
     //   2-5  sum A, sum B    A-RAM image checksum computed at boot
@@ -377,7 +335,15 @@ module primer25k_nanospc_top #(
     //   16-17 SPC700 writes to $F3 (DSP data)
     //   18   ... of which to KON ($4C)
     //   19-20 peak |sample| of the APU output
-    //   21   XOR of bytes 0-20
+    //   21   USB-MIDI host flags: bit0 dev_configured, bit1 dev_error
+    //   22-23 USB-MIDI host poll_count (IN tokens sent to the bulk endpoint)
+    //   24-25 USB-MIDI host nak_count (NAKs received on that endpoint)
+    //   26   XOR of bytes 0-25
+    // Bytes 21-25 isolate "never enumerated" (dev_configured=0) from
+    // "enumerated but the keyboard only ever NAKs" (poll_count growing,
+    // nak_count == poll_count) from "STALL/protocol error" (dev_error=1) on
+    // real hardware, without needing the dock's separate diagnostic path --
+    // see DESC_LAB3.md.
     reg [14:0] sample_count = 15'd0;
     reg        audio_seen = 1'b0;
     wire [15:0] dbg_sum_a, dbg_sum_b, dbg_boot_pc, dbg_smp_a, dbg_page05, dbg_dsp_wr;
@@ -388,12 +354,15 @@ module primer25k_nanospc_top #(
     reg         diag_pending = 1'b0;
     reg         diag_start = 1'b0;
     reg  [15:0] audio_peak = 16'd0;
-    reg  [8*22-1:0] diag_packet = {8*22{1'b0}};
+    reg  [8*27-1:0] diag_packet = {8*27{1'b0}};
 
     wire [15:0] abs_l = audio_l[15] ? (~audio_l + 16'd1) : audio_l;
     wire [15:0] abs_r = audio_r[15] ? (~audio_r + 16'd1) : audio_r;
 
-    wire [8*21-1:0] diag_body = {
+    wire [7:0] usb_midi_flags = {6'b0, usb_midi_dev_error, usb_midi_dev_configured};
+
+    wire [8*26-1:0] diag_body = {
+        usb_midi_nak_count, usb_midi_poll_count, usb_midi_flags,
         audio_peak, dbg_kon_wr, dbg_dsp_wr, dbg_page05, dbg_smp_a, port_dout,
         mb_sent, {dbg_sum_done, apu_running, audio_seen, 1'b0, mb_dropped, mb_timeout, pc_overrun, mb_busy},
         dbg_boot_pc, dbg_sum_b, dbg_sum_a, 8'h5A, 8'hA5
@@ -402,7 +371,7 @@ module primer25k_nanospc_top #(
     integer    di;
     always @* begin
         diag_xor = 8'h00;
-        for (di = 0; di < 21; di = di + 1)
+        for (di = 0; di < 26; di = di + 1)
             diag_xor = diag_xor ^ diag_body[8*di +: 8];
     end
 
@@ -427,7 +396,7 @@ module primer25k_nanospc_top #(
         end
     end
 
-    diag_tx #(.CLK_HZ(DCLK_HZ), .BAUD(UART_BAUD), .N(22)) diag (
+    diag_tx #(.CLK_HZ(DCLK_HZ), .BAUD(UART_BAUD), .N(27)) diag (
         .clk    (dclk),
         .resetn (resetn),
         .start  (diag_start),
@@ -436,9 +405,9 @@ module primer25k_nanospc_top #(
         .busy   (diag_busy)
     );
 
-    // Pacote de diagnostico do host USB (antigo, dependia dos contadores do
-    // host USB-MIDI proprio removido nesta integracao) foi retirado; o
-    // caminho de diagnostico/UART existente permanece como antes.
+    // O pacote de diagnostico inclui os contadores do host USB-MIDI nativo
+    // (usb_midi_dev_configured/dev_error/poll_count/nak_count, bytes 21-25
+    // acima) -- ver DESC_LAB3.md.
     assign uart_tx = diag_busy ? diag_tx_line : audio_tx;
 
     // ------------------------------------------------------------------------

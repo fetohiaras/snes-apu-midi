@@ -17,11 +17,19 @@ APU_RTL := \
 	../src/spc_core/spc700/spc700.v
 
 MIDI_IN_RTL := ../src/midi/uart_rx.v ../src/midi/midi_parser.v ../src/midi/midi_mailbox.v
+# gowin_pll_usb60.v ainda e usado (PLL de 60 MHz reaproveitado pelo host
+# USB-MIDI, ver DESC_LAB3.md secao 9, item 3). Os arquivos de
+# usb/usb_hid_note_bridge.v e usb/third_party/*.v nao sao mais instanciados
+# pelo topo (ver secao 9, item 2), mas sao mantidos na lista: compilam como
+# modulos nao referenciados, sem custo, e preservam a opcao de voltar ao
+# host HID bastando trocar a instancia em primer25k_nanospc_top.v de volta.
 USB_RTL := ../src/usb/gowin_pll_usb60.v ../src/usb/usb_hid_note_bridge.v \
 	../src/usb/third_party/usb_hid_host.v ../src/usb/third_party/usb_hid_host_rom.v
-RTL := ../src/primer25k_nanospc_top.v ../src/i2s_tx.v ../src/pc_audio_tx.v ../src/diag_tx.v $(MIDI_IN_RTL) $(USB_RTL) $(APU_RTL)
+USB_MIDI_RTL := ../src/usb_midi/usb_midi_sie.v ../src/usb_midi/usb_midi_host.v \
+	../src/usb_midi/usb_midi_note_bridge.v ../src/usb_midi/usb_midi_top.v
+RTL := ../src/primer25k_nanospc_top.v ../src/i2s_tx.v ../src/pc_audio_tx.v ../src/diag_tx.v $(MIDI_IN_RTL) $(USB_RTL) $(USB_MIDI_RTL) $(APU_RTL)
 
-.PHONY: build run test-i2s test-midi test-apu-midi test-top-midi midi-image spc-to-hex clean
+.PHONY: build run test-i2s test-midi test-apu-midi test-top-midi test-usb-midi-enum midi-image spc-to-hex clean
 
 build: $(BUILD_DIR)/V$(TOP)
 
@@ -81,6 +89,26 @@ test-apu-midi: $(APU_MIDI_DIR)/Vtb_apu_midi_top $(MIDI_IMG_DIR)/midi_boot.spc.he
 
 midi-image: ../src/data/midi_boot.spc.hex
 
+# Enumeracao do host USB-MIDI nativo contra um dispositivo minimo (ver
+# tb_usb_midi_enum.v): a primeira simulacao a acionar usb_dp/usb_dm com
+# respostas reais (ACK/DATA1/NAK), em vez do barramento vazio que
+# test-top-midi exercita.
+USB_MIDI_ENUM_DIR := obj_usb_midi_enum
+USB_MIDI_ENUM_RTL := tb_usb_midi_enum.v ../src/usb_midi/usb_midi_sie.v ../src/usb_midi/usb_midi_host.v
+
+# -public expoe todos os sinais internos (inclusive os do usb_midi_host
+# instanciado como "dut") como membros C++ acessiveis, so para esta
+# depuracao pontual -- nao requer nenhuma alteracao no RTL de producao.
+$(USB_MIDI_ENUM_DIR)/Vtb_usb_midi_enum: tb_usb_midi_enum.cpp $(USB_MIDI_ENUM_RTL)
+	mkdir -p $(USB_MIDI_ENUM_DIR)
+	verilator --sv --top-module tb_usb_midi_enum --cc --exe -O3 -Wall -public \
+		--Mdir $(USB_MIDI_ENUM_DIR) -I../src/usb_midi \
+		$(USB_MIDI_ENUM_RTL) tb_usb_midi_enum.cpp
+	$(MAKE) -C $(USB_MIDI_ENUM_DIR) -f Vtb_usb_midi_enum.mk Vtb_usb_midi_enum
+
+test-usb-midi-enum: $(USB_MIDI_ENUM_DIR)/Vtb_usb_midi_enum
+	$(USB_MIDI_ENUM_DIR)/Vtb_usb_midi_enum
+
 # Full-chain integration: MIDI bytes on the midi_rx pin of the real top,
 # checked stage by stage (see check_top_midi.py).
 TOP_MIDI_DIR := obj_top_midi
@@ -93,7 +121,7 @@ $(TOP_MIDI_DIR)/V$(TOP): tb_top_midi.cpp $(RTL)
 	verilator --sv --top-module $(TOP) --cc --exe -O3 \
 		--Mdir $(TOP_MIDI_DIR) -GUART_BAUD=$(UART_BAUD) \
 		-GPC_AUDIO_FORMAT=$(PC_FORMAT) -GPC_AUDIO_DECIM=$(PC_DECIM) \
-		-I../src -I../src/spc_core -I../src/spc_core/spc700 \
+		-I../src -I../src/spc_core -I../src/spc_core/spc700 -I../src/usb_midi \
 		$(RTL) tb_top_midi.cpp
 	$(MAKE) -C $(TOP_MIDI_DIR) -f V$(TOP).mk V$(TOP)
 
@@ -131,4 +159,4 @@ spc-to-hex:
 	python3 ../tools/spc_to_hex.py "$(SPC)" "$(HEX)"
 
 clean:
-	rm -rf $(BUILD_DIR) $(I2S_DIR) $(MIDI_DIR) $(APU_MIDI_DIR) $(TOP_MIDI_DIR) $(MIDI_IMG_DIR) output
+	rm -rf $(BUILD_DIR) $(I2S_DIR) $(MIDI_DIR) $(APU_MIDI_DIR) $(TOP_MIDI_DIR) $(USB_MIDI_ENUM_DIR) $(MIDI_IMG_DIR) output

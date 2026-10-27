@@ -79,22 +79,28 @@ def decodificar_ulaw(dados: bytes):
 
 
 def decodificar_diag(pkt: bytes) -> dict | None:
-    """Pacote de diagnóstico de 22 bytes da FPGA (ver primer25k_nanospc_top.v)."""
-    if len(pkt) != 22 or pkt[:2] != b"\xa5\x5a":
+    """Pacote de diagnóstico de 27 bytes da FPGA (ver primer25k_nanospc_top.v)."""
+    if len(pkt) != 27 or pkt[:2] != b"\xa5\x5a":
         return None
     x = 0
-    for b in pkt[:21]:
+    for b in pkt[:26]:
         x ^= b
     u16 = lambda i: pkt[i] | (pkt[i + 1] << 8)
     f = pkt[8]
+    uf = pkt[21]
     return {
-        "ok": x == pkt[21],
+        "ok": x == pkt[26],
         "soma_a": u16(2), "soma_b": u16(4), "pc_boot": u16(6),
         "flags": f, "soma_ok": bool(f & 0x80), "rodando": bool(f & 0x40), "audio": bool(f & 0x20),
         "descartados": bool(f & 0x08), "timeout": bool(f & 0x04), "overrun": bool(f & 0x02),
         "ocupado": bool(f & 0x01), "erros": bool(f & 0x0E),
         "enviados": u16(9), "porta3": pkt[11], "smp_a": u16(12), "ciclos_05": u16(14),
         "escritas_dsp": u16(16), "kon": pkt[18], "pico": u16(19),
+        # Host USB-MIDI nativo (src/usb_midi/usb_midi_host.v): status de
+        # enumeração/polling no endpoint bulk IN do teclado, independente do
+        # caminho mailbox/driver acima.
+        "usb_configurado": bool(uf & 0x01), "usb_erro": bool(uf & 0x02),
+        "usb_poll": u16(22), "usb_nak": u16(24),
     }
 
 
@@ -119,10 +125,10 @@ def diagnostico(ser, send) -> None:
     while time.time() < fim:
         dados += ser.read(4096)
         i = dados.find(b"\xa5\x5a")
-        if i >= 0 and len(dados) >= i + 22:
+        if i >= 0 and len(dados) >= i + 27:
             break
     i = dados.find(b"\xa5\x5a")
-    d = decodificar_diag(dados[i:i + 22]) if i >= 0 else None
+    d = decodificar_diag(dados[i:i + 27]) if i >= 0 else None
     if d is None:
         extra = ""
         if dados and dados.count(0xFF) > len(dados) // 2:
@@ -142,6 +148,12 @@ def diagnostico(ser, send) -> None:
     print(f"  SPC700 agora em ${d['smp_a']:04X}; ciclos na página $05 (driver): {d['ciclos_05']}"
           + ("  <- driver não está executando" if d["ciclos_05"] == 0 else ""))
     print(f"  escritas no DSP: {d['escritas_dsp']}, das quais KON: {d['kon']}")
+    print(f"  host USB-MIDI nativo (teclado no USB-A da placa): configurado: {sim(d['usb_configurado'])}, "
+          f"erro/STALL: {sim(d['usb_erro'])}, polls no endpoint bulk IN: {d['usb_poll']}, NAKs: {d['usb_nak']}"
+          + (" <- nunca enumerou (bus reset/handshake travado, ver DESC_LAB3.md)" if not d['usb_configurado'] and not d['usb_erro'] else "")
+          + (" <- STALL ou timeout no endpoint" if d['usb_erro'] else "")
+          + (" <- enumerou, mas só recebe NAK (teclado sem evento novo no endpoint consultado)"
+             if d['usb_configurado'] and not d['usb_erro'] and d['usb_poll'] > 0 and d['usb_poll'] == d['usb_nak'] else ""))
     print(f"  caixa de correio: {d['enviados']} comandos confirmados, porta 3 = {d['porta3']}, "
           f"descartados: {sim(d['descartados'])}, timeout: {sim(d['timeout'])}, ocupada: {sim(d['ocupado'])}")
     print(f"  pico do áudio: {d['pico']}   áudio visto: {sim(d['audio'])}   overrun do áudio: {sim(d['overrun'])}")

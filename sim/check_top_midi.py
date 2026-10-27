@@ -41,7 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 import midi_bridge  # noqa: E402
 
 CLK_HZ = 24_528_000
-DIAG_LEN = 22
+DIAG_LEN = 27
 
 SYSEX_GM_ON = [0xF0, 0x7E, 0x7F, 0x09, 0x01, 0xF7]
 
@@ -244,6 +244,16 @@ def main() -> int:
         peak = int(max(np.abs(top_l.astype(np.int32)).max(), np.abs(top_r.astype(np.int32)).max()))
         c.check(info["pico"] == peak and info["rodando"] and info["audio"] and not info["erros"],
                 "status flags and output peak", f"peak {info['pico']} (expected {peak}), flags {info['flags']:08b}")
+        # The testbench never drives usb_dp/usb_dm (no simulated USB-MIDI
+        # keyboard), so the native host should time out during enumeration
+        # (SETUP never ACKed) and report dev_error, never reaching
+        # dev_configured or polling the bulk endpoint; this only confirms
+        # the new diagnostic fields are present and decodable, not that a
+        # real device is connected.
+        c.check(not info["usb_configurado"] and info["usb_erro"] and info["usb_poll"] == 0,
+                "USB-MIDI host diagnostic fields present (enumeration times out, no simulated device on usb_dp/usb_dm)",
+                f"configurado={info['usb_configurado']}, erro={info['usb_erro']}, "
+                f"poll={info['usb_poll']}, nak={info['usb_nak']}")
 
     # LED: on while booted and silent; off at the first non-zero sample, then
     # bit 14 of the sample counter toggles it every 16384 samples.
