@@ -28,7 +28,11 @@ module primer25k_nanospc_top #(
     parameter integer PC_AUDIO_KEEPALIVE_MS = 300,
     // Diagnostics: a 0xF9 byte on midi_rx (ignored by the MIDI parser)
     // requests a status packet on uart_tx; see tools/midi_bridge.py --diag.
-    parameter integer DIAG = 1
+    parameter integer DIAG = 1,
+    // USB host bring-up on the dock's USB-A port (usb_host_probe): reads
+    // the attached device's descriptor; 0xFD on midi_rx requests its status
+    // packet. Adds a second PLL for the 48 MHz USB clock.
+    parameter integer USB_HOST = 1
 ) (
     input  wire clk_50m,
     input  wire midi_rx,
@@ -38,6 +42,11 @@ module primer25k_nanospc_top #(
     output wire i2s_bclk,
     output wire i2s_lrclk,
     output wire i2s_sdata
+`ifndef VERILATOR
+    // Dock USB-A host port: L6 = D+, K6 = D- (15k pulldowns on the dock)
+    ,inout  wire usb_dp
+    ,inout  wire usb_dn
+`endif
 `ifdef VERILATOR
     // These ports exist solely in the C++ simulation model.  They are absent
     // from the synthesis elaboration and therefore do not consume FPGA pins.
@@ -54,6 +63,13 @@ module primer25k_nanospc_top #(
     ,output wire        sim_mb_timeout
     ,output wire        sim_mb_busy
     ,output wire        sim_pc_overrun
+    // USB: the testbench supplies the 48 MHz clock and resolves the bus
+    ,input  wire        sim_clk48
+    ,input  wire        sim_usb_dp
+    ,input  wire        sim_usb_dn
+    ,output wire        sim_usb_tx_dp
+    ,output wire        sim_usb_tx_dn
+    ,output wire        sim_usb_tx_oen
 `endif
 );
 
@@ -66,17 +82,31 @@ module primer25k_nanospc_top #(
     // clocks the generated PLL initialisation controller; use the stable board
     // clock for both inputs.
     wire dclk;
+    wire clk48;     // USB full speed (USB_HOST only)
 
 `ifdef VERILATOR
     // The behavioural simulation has no Gowin PLL primitive.  The simulation
     // harness supplies the desired clock rate; hardware always uses the IP.
-    assign dclk = clk_50m;
+    assign dclk  = clk_50m;
+    assign clk48 = sim_clk48;
 `else
     Gowin_PLL pll_dsp (
         .clkin  (clk_50m),
         .clkout0(dclk),
         .mdclk  (clk_50m)
     );
+
+    generate
+        if (USB_HOST != 0) begin : g_pll_usb
+            Gowin_PLL48 pll_usb (
+                .clkin  (clk_50m),
+                .clkout0(clk48),
+                .mdclk  (clk_50m)
+            );
+        end else begin : g_no_pll_usb
+            assign clk48 = 1'b0;
+        end
+    endgenerate
 `endif
 
     // There is no external reset in this first board test.  Hold the APU in
@@ -120,6 +150,51 @@ module primer25k_nanospc_top #(
         .ev_data2  (ev_data2)
     );
 
+    // USB-MIDI bytes from the host port (USB_HOST; see the USB section below)
+    // go through their own parser, so running status on one input can never
+    // mix with the other; the events are merged in front of the mailbox.
+    wire       usb_byte_valid;
+    wire [7:0] usb_byte;
+    wire       uev_valid;
+    wire [7:0] uev_status;
+    wire [6:0] uev_data1;
+    wire [6:0] uev_data2;
+
+    midi_parser usb_parser (
+        .clk       (dclk),
+        .resetn    (resetn),
+        .in_valid  (usb_byte_valid),
+        .in_byte   (usb_byte),
+        .ev_valid  (uev_valid),
+        .ev_status (uev_status),
+        .ev_data1  (uev_data1),
+        .ev_data2  (uev_data2)
+    );
+
+    // UART events go straight through; a USB event that collides with one
+    // waits a clock. One entry is enough: USB bytes (and so events) are at
+    // least two clocks apart, UART events thousands.
+    reg        uhold_valid = 1'b0;
+    reg  [7:0] uhold_status = 8'd0;
+    reg  [6:0] uhold_data1 = 7'd0, uhold_data2 = 7'd0;
+    wire       mev_valid  = ev_valid | uhold_valid | uev_valid;
+    wire [7:0] mev_status = ev_valid ? ev_status : uhold_valid ? uhold_status : uev_status;
+    wire [6:0] mev_data1  = ev_valid ? ev_data1  : uhold_valid ? uhold_data1  : uev_data1;
+    wire [6:0] mev_data2  = ev_valid ? ev_data2  : uhold_valid ? uhold_data2  : uev_data2;
+
+    always @(posedge dclk) begin
+        if (!resetn) begin
+            uhold_valid <= 1'b0;
+        end else if (uev_valid && (ev_valid || uhold_valid)) begin
+            uhold_valid  <= 1'b1;
+            uhold_status <= uev_status;
+            uhold_data1  <= uev_data1;
+            uhold_data2  <= uev_data2;
+        end else if (!ev_valid) begin
+            uhold_valid <= 1'b0;
+        end
+    end
+
     // ------------------------------------------------------------------------
     // Mailbox -> APU
     // ------------------------------------------------------------------------
@@ -138,10 +213,10 @@ module primer25k_nanospc_top #(
         .clk         (dclk),
         .resetn      (resetn),
         .apu_running (apu_running),
-        .ev_valid    (ev_valid),
-        .ev_status   (ev_status),
-        .ev_data1    (ev_data1),
-        .ev_data2    (ev_data2),
+        .ev_valid    (mev_valid),
+        .ev_status   (mev_status),
+        .ev_data1    (mev_data1),
+        .ev_data2    (mev_data2),
         .port_a      (port_a),
         .port_wr_n   (port_wr_n),
         .port_cs     (port_cs),
@@ -299,7 +374,7 @@ module primer25k_nanospc_top #(
             if (DIAG != 0 && diag_req)
                 diag_pending <= 1'b1;
             // Wait for the audio stream to go quiet, then snapshot and send.
-            if (diag_pending && !pc_listening && !pc_busy && !diag_busy) begin
+            if (diag_pending && !pc_listening && !pc_busy && !diag_busy && !usb_diag_busy && !usb_diag_start) begin
                 diag_packet  <= {diag_xor, diag_body};
                 diag_start   <= 1'b1;
                 diag_pending <= 1'b0;
@@ -316,7 +391,245 @@ module primer25k_nanospc_top #(
         .busy   (diag_busy)
     );
 
-    assign uart_tx = diag_busy ? diag_tx_line : audio_tx;
+    // ------------------------------------------------------------------------
+    // USB host probe (clk48 domain) and its status packet (0xFD request)
+    // ------------------------------------------------------------------------
+    //   0-1  A5 5B           magic
+    //   2    state           usb_host_probe: 0 detached, 1 reset, 2 recover,
+    //                        3 setup, 4 data in, 5 status out, 6 done (no
+    //                        MIDI endpoint), 7 status in, 8 set-address wait,
+    //                        9 descriptor scan, 10 receiving MIDI
+    //   3    {0, 0, req[1:0], 0, 0, line state}
+    //                        req: 0 GET_DESCRIPTOR(DEVICE), 1 SET_ADDRESS,
+    //                        2 GET_DESCRIPTOR(CONFIGURATION), 3 SET_CONFIGURATION;
+    //                        line state {D-, D+} (01 = FS device idle)
+    //   4-5  frame number    SOFs sent since the last reset
+    //   6    attach count
+    //   7    last response PID (00 = timeout)
+    //   8-10 NAK, timeout, CRC-error counts (saturating)
+    //   11   device descriptor bytes received (18 = complete)
+    //   12-29 device descriptor (VID at 20-21, PID at 22-23 of the packet)
+    //   30   device address  31  configuration set (0 = not yet)
+    //   32-33 L = configuration descriptor bytes received (<= 256)
+    //   34   MIDI IN endpoint address (0 = none found)
+    //   35   {FIFO overflow, endpoint packet size}
+    //   36-37 MIDI bytes received   38-39 bulk packets accepted
+    //   40.. configuration descriptor (L bytes)
+    //   40+L XOR of all previous bytes
+    wire       usb_diag_req = rx_valid && (rx_byte == 8'hFD);
+    wire       usb_diag_tx_line;
+    wire       usb_diag_busy;
+    wire       usb_diag_start;
+
+    generate
+        if (USB_HOST != 0) begin : g_usb
+            // Reset: hold the USB domain until the board reset is released.
+            reg [2:0] rst48_sync = 3'b111;
+            always @(posedge clk48)
+                rst48_sync <= {rst48_sync[1:0], ~resetn};
+            wire rst48 = rst48_sync[2];
+
+            wire [7:0] utx_data, urx_data;
+            wire       utx_valid, utx_ready, urx_valid, urx_active;
+            wire [1:0] linestate;
+            wire       bus_reset;
+            wire       phy_tx_dp, phy_tx_dn, phy_tx_oen;
+            wire       phy_rx_dp, phy_rx_dn, phy_rx_rcv;
+
+`ifdef VERILATOR
+            assign phy_rx_dp      = sim_usb_dp;
+            assign phy_rx_dn      = sim_usb_dn;
+            assign phy_rx_rcv     = sim_usb_dp & ~sim_usb_dn;
+            assign sim_usb_tx_dp  = phy_tx_dp;
+            assign sim_usb_tx_dn  = phy_tx_dn;
+            assign sim_usb_tx_oen = phy_tx_oen;
+`else
+            // Single-ended drive straight from the PHY (usb_transceiver.v in
+            // mode 1); the receiver is the D+/D- pair itself.
+            assign usb_dp     = phy_tx_oen ? 1'bz : phy_tx_dp;
+            assign usb_dn     = phy_tx_oen ? 1'bz : phy_tx_dn;
+            assign phy_rx_dp  = usb_dp;
+            assign phy_rx_dn  = usb_dn;
+            assign phy_rx_rcv = usb_dp & ~usb_dn;
+`endif
+
+            usb_fs_phy phy (
+                .clk_i(clk48), .rst_i(rst48),
+                .utmi_data_out_i(utx_data), .utmi_txvalid_i(utx_valid),
+                .utmi_op_mode_i(2'b00), .utmi_xcvrselect_i(2'b01), .utmi_termselect_i(1'b0),
+                .utmi_dppulldown_i(1'b1), .utmi_dmpulldown_i(1'b1),
+                .usb_rx_rcv_i(phy_rx_rcv), .usb_rx_dp_i(phy_rx_dp), .usb_rx_dn_i(phy_rx_dn),
+                .usb_reset_assert_i(bus_reset),
+                .utmi_data_in_o(urx_data), .utmi_txready_o(utx_ready), .utmi_rxvalid_o(urx_valid),
+                .utmi_rxactive_o(urx_active), .utmi_rxerror_o(), .utmi_linestate_o(linestate),
+                .usb_tx_dp_o(phy_tx_dp), .usb_tx_dn_o(phy_tx_dn), .usb_tx_oen_o(phy_tx_oen),
+                .usb_reset_detect_o(), .usb_en_o()
+            );
+
+            wire [3:0]  st;
+            wire [1:0]  req;
+            wire [6:0]  dev_addr;
+            wire [7:0]  config_value;
+            wire [10:0] frame;
+            wire [7:0]  attach_count, last_pid, nak_count, timeout_count, crc_count;
+            wire [4:0]  desc_len;
+            wire [8*18-1:0] desc;
+            wire [8:0]  cfg_len;
+            wire [7:0]  midi_ep;
+            wire [6:0]  midi_ep_size;
+            wire [15:0] midi_bytes, bulk_packets;
+            wire        m_we, m_commit, m_rollback, m_overflow;
+            wire [7:0]  m_wdata;
+            wire        cfg_we;
+            wire [7:0]  cfg_waddr, cfg_wdata;
+
+            usb_host_probe #(.USB_CLK_HZ(48000000)) probe (
+                .clk(clk48), .rst(rst48),
+                .utmi_data_o(utx_data), .utmi_txvalid_o(utx_valid), .utmi_txready_i(utx_ready),
+                .utmi_data_i(urx_data), .utmi_rxvalid_i(urx_valid), .utmi_rxactive_i(urx_active),
+                .utmi_linestate_i(linestate), .usb_reset_o(bus_reset),
+                .cfg_we(cfg_we), .cfg_waddr(cfg_waddr), .cfg_wdata(cfg_wdata),
+                .midi_we(m_we), .midi_wdata(m_wdata), .midi_commit(m_commit), .midi_rollback(m_rollback),
+                .state(st), .req(req), .dev_addr(dev_addr), .config_value(config_value),
+                .frame(frame), .attach_count(attach_count), .last_pid(last_pid),
+                .nak_count(nak_count), .timeout_count(timeout_count), .crc_count(crc_count),
+                .desc_len(desc_len), .desc(desc), .cfg_len(cfg_len),
+                .midi_ep(midi_ep), .midi_ep_size(midi_ep_size), .midi_bytes(midi_bytes),
+                .bulk_packets(bulk_packets)
+            );
+
+            // MIDI bytes to the dclk domain (commit/rollback per USB packet)
+            usb_midi_fifo midi_fifo (
+                .wclk(clk48), .wrst(rst48), .we(m_we), .wdata(m_wdata),
+                .commit(m_commit), .rollback(m_rollback), .overflow(m_overflow),
+                .rclk(dclk), .rresetn(resetn), .ready(1'b1),
+                .valid(usb_byte_valid), .data(usb_byte)
+            );
+
+            // Configuration descriptor: written at 48 MHz, read on dclk. The
+            // probe only writes it during the configuration read, so a read
+            // in DONE sees stable data.
+            reg [7:0] cfg_mem [0:255];
+            reg [7:0] cfg_raddr = 8'd0;
+            reg [7:0] cfg_q = 8'd0;
+            always @(posedge clk48)
+                if (cfg_we) cfg_mem[cfg_waddr] <= cfg_wdata;
+            always @(posedge dclk)
+                cfg_q <= cfg_mem[cfg_raddr];
+
+            // Snapshot handshake: dclk toggles req, clk48 captures the status
+            // and toggles ack; the snapshot is stable by the time dclk sees it.
+            localparam integer HDR = 40;
+            reg            req_t = 1'b0, ack48_t = 1'b0;
+            reg  [2:0]     req_sync = 3'b000, ack_sync = 3'b000;
+            reg            waiting = 1'b0, pending = 1'b0, ready = 1'b0;
+            reg  [8*38-1:0] snap = {8*38{1'b0}};
+
+            always @(posedge clk48) begin
+                req_sync <= {req_sync[1:0], req_t};
+                if (req_sync[2] != req_sync[1]) begin
+                    snap <= {bulk_packets, midi_bytes, m_overflow, midi_ep_size, midi_ep,
+                             7'd0, cfg_len, config_value, 1'b0, dev_addr,
+                             desc, 3'b000, desc_len, crc_count, timeout_count, nak_count,
+                             last_pid, attach_count, 5'd0, frame,
+                             2'b00, req, 2'b00, linestate, 4'd0, st};
+                    ack48_t <= ~ack48_t;
+                end
+            end
+
+            // Byte-at-a-time sender: header, then the RAM, then the XOR.
+            localparam [2:0] T_IDLE = 3'd0, T_LOAD = 3'd1, T_FETCH = 3'd2, T_SEND = 3'd3,
+                             T_HOLD = 3'd4, T_WAIT = 3'd5;
+            reg  [2:0] ts = T_IDLE;
+            reg  [8:0] idx = 9'd0;
+            reg  [7:0] sum = 8'd0;
+            reg  [7:0] tx_byte = 8'd0;
+            reg        tx_start = 1'b0;
+            wire       byte_busy;
+            wire [9:0] total = HDR + {1'b0, snap[8*30 +: 9]};      // index of the XOR byte
+            wire [7:0] hdr_byte = idx == 9'd0 ? 8'hA5 : idx == 9'd1 ? 8'h5B :
+                                  snap[8*(idx - 9'd2) +: 8];
+            wire [7:0] cur_byte = {1'b0, idx} == total ? sum :
+                                  idx < HDR[8:0] ? hdr_byte : cfg_q;
+            wire       launch = ts == T_IDLE && ready && !pc_listening && !pc_busy &&
+                                !diag_pending && !diag_start && !diag_busy;
+
+            always @(posedge dclk) begin
+                tx_start <= 1'b0;
+                ack_sync <= {ack_sync[1:0], ack48_t};
+                if (!resetn) begin
+                    pending <= 1'b0;
+                    waiting <= 1'b0;
+                    ready   <= 1'b0;
+                    ts      <= T_IDLE;
+                end else begin
+                    if (usb_diag_req)
+                        pending <= 1'b1;
+                    if (pending && !waiting && !ready && ts == T_IDLE) begin
+                        req_t   <= ~req_t;
+                        waiting <= 1'b1;
+                        pending <= 1'b0;
+                    end
+                    if (waiting && ack_sync[2] != ack_sync[1]) begin
+                        waiting <= 1'b0;
+                        ready   <= 1'b1;
+                    end
+                    case (ts)
+                    T_IDLE:  if (launch) begin   // same rules as the main packet; it has priority
+                                 ready <= 1'b0;
+                                 idx   <= 9'd0;
+                                 sum   <= 8'd0;
+                                 ts    <= T_LOAD;
+                             end
+                    T_LOAD:  begin cfg_raddr <= 8'(idx - HDR[8:0]); ts <= T_FETCH; end
+                    T_FETCH: ts <= T_SEND;     // cfg_q valid next cycle
+                    T_SEND:  begin
+                                 tx_byte  <= cur_byte;
+                                 tx_start <= 1'b1;
+                                 sum      <= sum ^ cur_byte;
+                                 ts       <= T_HOLD;
+                             end
+                    T_HOLD:  ts <= T_WAIT;     // byte_busy rises
+                    default: if (!byte_busy) begin
+                                 if ({1'b0, idx} == total) begin
+                                     ts <= T_IDLE;
+                                 end else begin
+                                     idx <= idx + 9'd1;
+                                     ts  <= T_LOAD;
+                                 end
+                             end
+                    endcase
+                end
+            end
+
+            diag_tx #(.CLK_HZ(DCLK_HZ), .BAUD(UART_BAUD), .N(1)) usb_diag (
+                .clk    (dclk),
+                .resetn (resetn),
+                .start  (tx_start),
+                .data   (tx_byte),
+                .tx     (usb_diag_tx_line),
+                .busy   (byte_busy)
+            );
+            assign usb_diag_busy  = ts != T_IDLE;
+            assign usb_diag_start = launch;
+        end else begin : g_no_usb
+            assign usb_diag_start   = 1'b0;
+            assign usb_diag_tx_line = 1'b1;
+            assign usb_diag_busy    = 1'b0;
+            assign usb_byte_valid   = 1'b0;
+            assign usb_byte         = 8'd0;
+`ifndef VERILATOR
+            assign usb_dp = 1'bz;
+            assign usb_dn = 1'bz;
+`else
+            assign sim_usb_tx_dp  = 1'b0;
+            assign sim_usb_tx_dn  = 1'b0;
+            assign sim_usb_tx_oen = 1'b1;
+`endif
+        end
+    endgenerate
+
+    assign uart_tx = diag_busy ? diag_tx_line : usb_diag_busy ? usb_diag_tx_line : audio_tx;
 
     // ------------------------------------------------------------------------
     // Status LED

@@ -31,19 +31,29 @@ import wave
 TAXA_APU = 24_528_000 / 768          # taxa de amostragem da APU na placa (Hz)
 
 
-def _imports():
+def _imports(precisa_midi: bool = True):
+    """mido (+ python-rtmidi) só é necessário para ler um teclado ligado ao PC."""
     try:
-        import mido
         import serial
         import serial.tools.list_ports
     except ImportError as e:
-        raise SystemExit(f"dependência ausente ({e.name}); instale com: pip install mido python-rtmidi pyserial")
+        raise SystemExit(f"dependência ausente ({e.name}); instale com: pip install pyserial")
+    try:
+        import mido
+    except ImportError:
+        if precisa_midi:
+            raise SystemExit("dependência ausente (mido); instale com: pip install mido python-rtmidi")
+        mido = None
     return mido, serial
 
 
 def listar(mido, serial) -> None:
     print("Entradas MIDI:")
-    for name in mido.get_input_names() or ["  (nenhuma)"]:
+    try:
+        nomes = mido.get_input_names() if mido else ["  (mido não instalado: pip install mido python-rtmidi)"]
+    except Exception as e:                  # ex.: rtmidi com o libstdc++ antigo do conda
+        nomes = [f"  (backend MIDI indisponível: {str(e)[:100]}...; ver LD_PRELOAD no README)"]
+    for name in nomes or ["  (nenhuma)"]:
         print(f"  {name}")
     print("Portas seriais:")
     portas = [p for p in serial.tools.list_ports.comports() if p.description != "n/a"]  # sem ttyS* vazias
@@ -96,6 +106,129 @@ def decodificar_diag(pkt: bytes) -> dict | None:
         "enviados": u16(9), "porta3": pkt[11], "smp_a": u16(12), "ciclos_05": u16(14),
         "escritas_dsp": u16(16), "kon": pkt[18], "pico": u16(19),
     }
+
+
+ESTADOS_USB = ("desconectado", "reset", "recuperação", "SETUP", "IN (dados)", "status (OUT)",
+               "configurado, sem endpoint MIDI", "status (IN)", "espera após SET_ADDRESS",
+               "procurando o endpoint MIDI", "recebendo MIDI")
+PEDIDOS_USB = ("GET_DESCRIPTOR(DEVICE)", "SET_ADDRESS", "GET_DESCRIPTOR(CONFIGURATION)", "SET_CONFIGURATION")
+PIDS_USB = {0x00: "timeout", 0xD2: "ACK", 0x5A: "NAK", 0x1E: "STALL", 0xC3: "DATA0", 0x4B: "DATA1"}
+CABECALHO_USB = 40
+
+
+def decodificar_usb(pkt: bytes) -> dict | None:
+    """Pacote de estado do host USB (0xFD; ver primer25k_nanospc_top.v):
+    40 bytes de cabeçalho, L bytes do descritor de configuração e o XOR."""
+    if len(pkt) < CABECALHO_USB + 1 or pkt[:2] != b"\xa5\x5b":
+        return None
+    n = pkt[32] | (pkt[33] << 8)
+    if len(pkt) != CABECALHO_USB + n + 1:
+        return None
+    x = 0
+    for b in pkt[:-1]:
+        x ^= b
+    return {
+        "ok": x == pkt[-1], "estado": pkt[2], "pedido": (pkt[3] >> 4) & 3, "linha": pkt[3] & 3,
+        "quadro": pkt[4] | (pkt[5] << 8), "conexoes": pkt[6], "pid": pkt[7], "nak": pkt[8],
+        "timeout": pkt[9], "crc": pkt[10], "n_desc": pkt[11], "desc": pkt[12:30],
+        "endereco": pkt[30], "config": pkt[31], "cfg": pkt[CABECALHO_USB:CABECALHO_USB + n],
+        "ep_midi": pkt[34], "ep_tam": pkt[35] & 0x7F, "overflow": bool(pkt[35] & 0x80),
+        "bytes_midi": pkt[36] | (pkt[37] << 8), "pacotes": pkt[38] | (pkt[39] << 8),
+    }
+
+
+def ler_pacote_usb(ser, send) -> bytes | None:
+    time.sleep(0.5)                         # deixa o fluxo de áudio parar (keep-alive)
+    ser.reset_input_buffer()
+    send([0xFD])
+    dados = b""
+    fim = time.time() + 2.0                 # até 297 bytes a 115200 baud: ~26 ms
+    while time.time() < fim:
+        dados += ser.read(4096)
+        i = dados.find(b"\xa5\x5b")
+        if i >= 0 and len(dados) >= i + CABECALHO_USB:
+            n = CABECALHO_USB + (dados[i + 32] | (dados[i + 33] << 8)) + 1
+            if len(dados) >= i + n:
+                return dados[i:i + n]
+    print(f"nenhum pacote ({len(dados)} bytes recebidos: {dados[:24].hex(' ')})")
+    return None
+
+
+def descrever_configuracao(cfg: bytes) -> list[str]:
+    """Percorre o descritor de configuração e descreve interfaces, jacks MIDI e endpoints."""
+    tipos_ep = ("controle", "isócrono", "bulk", "interrupção")
+    classes = {(1, 1): "Audio Control", (1, 3): "MIDI Streaming", (1, 2): "Audio Streaming"}
+    linhas, i = [], 0
+    while i + 2 <= len(cfg):
+        n, tipo = cfg[i], cfg[i + 1]
+        if n < 2 or i + n > len(cfg):
+            linhas.append(f"    (descritor truncado em {i}: {cfg[i:].hex(' ')})")
+            break
+        d = cfg[i:i + n]
+        if tipo == 2 and n >= 9:
+            linhas.append(f"  configuração {d[5]}: {d[2] | (d[3] << 8)} bytes, {d[4]} interface(s), "
+                          f"atributos {d[7]:02X}, até {2 * d[8]} mA")
+        elif tipo == 4 and n >= 9:
+            nome = classes.get((d[5], d[6]), f"classe {d[5]:02X}/{d[6]:02X}/{d[7]:02X}")
+            linhas.append(f"  interface {d[2]} (alt {d[3]}): {nome}, {d[4]} endpoint(s)")
+        elif tipo == 5 and n >= 7:
+            sentido = "IN " if d[2] & 0x80 else "OUT"
+            linhas.append(f"    endpoint 0x{d[2]:02X} {sentido} {tipos_ep[d[3] & 3]}, "
+                          f"{d[4] | (d[5] << 8)} bytes, intervalo {d[6]}")
+        elif tipo == 0x24 and n >= 3:
+            sub = d[2]
+            if sub == 2 and n >= 6:
+                linhas.append(f"    jack MIDI IN {d[4]} ({'embutido' if d[3] == 1 else 'externo'})")
+            elif sub == 3 and n >= 7:
+                origens = ", ".join(str(d[6 + 2 * k]) for k in range(d[5]) if 6 + 2 * k < n)
+                linhas.append(f"    jack MIDI OUT {d[4]} ({'embutido' if d[3] == 1 else 'externo'}) <- {origens}")
+            elif sub == 1:
+                linhas.append(f"    cabeçalho de classe ({d.hex(' ')})")
+            else:
+                linhas.append(f"    descritor de classe, subtipo {sub:02X} ({d.hex(' ')})")
+        elif tipo == 0x25 and n >= 4:
+            jacks = ", ".join(str(j) for j in d[4:4 + d[3]])
+            linhas.append(f"      endpoint MIDI: jack(s) embutido(s) {jacks}")
+        else:
+            linhas.append(f"    descritor tipo {tipo:02X} ({d.hex(' ')})")
+        i += n
+    return linhas
+
+
+def diagnostico_usb(ser, send) -> None:
+    pkt = ler_pacote_usb(ser, send)
+    d = decodificar_usb(pkt) if pkt else None
+    if d is None:
+        print("host USB: sem resposta (bitstream sem USB_HOST = 1?)")
+        return
+    estado = ESTADOS_USB[d["estado"]] if d["estado"] < len(ESTADOS_USB) else f"? ({d['estado']})"
+    linha = {0: "SE0 (nada conectado)", 1: "J (dispositivo full-speed)", 2: "K (low-speed?)", 3: "SE1 (inválido)"}
+    print("host USB" + ("" if d["ok"] else " (XOR do pacote INVÁLIDO)"))
+    print(f"  estado: {estado} (pedido: {PEDIDOS_USB[d['pedido']]})   linha D+/D-: {linha[d['linha']]}")
+    print(f"  conexões: {d['conexoes']}   quadro: {d['quadro']}   endereço: {d['endereco']}   "
+          f"configuração ativa: {d['config'] or 'nenhuma'}")
+    if d["ep_midi"]:
+        print(f"  endpoint MIDI: 0x{d['ep_midi']:02X}, {d['ep_tam']} bytes   recebidos: {d['bytes_midi']} bytes MIDI "
+              f"em {d['pacotes']} pacotes" + ("   FIFO TRANSBORDOU" if d["overflow"] else ""))
+    elif d["estado"] == 6:
+        print("  nenhum endpoint IN (bulk ou interrupção) em interface MIDI Streaming (01/03) no descritor")
+    pid = PIDS_USB.get(d["pid"], f"{d['pid']:02X}")
+    print(f"  última resposta: {pid}   NAK: {d['nak']}  timeouts: {d['timeout']}  erros de CRC: {d['crc']}")
+    desc = d["desc"]
+    print(f"  descritor do dispositivo: {d['n_desc']}/18 bytes: {desc[:d['n_desc']].hex(' ')}")
+    if d["n_desc"] >= 18:
+        u16 = lambda i: desc[i] | (desc[i + 1] << 8)
+        print(f"  USB {desc[3]:x}.{desc[2]:02x}  classe {desc[4]:02X}/{desc[5]:02X}/{desc[6]:02X}  "
+              f"EP0 {desc[7]} bytes  VID:PID {u16(8):04X}:{u16(10):04X}  versão {u16(12):04X}  "
+              f"{desc[17]} configuração(ões)")
+    cfg = d["cfg"]
+    if cfg:
+        total = cfg[2] | (cfg[3] << 8) if len(cfg) >= 4 else 0
+        print(f"  descritor de configuração: {len(cfg)} bytes"
+              + (f" (o dispositivo informa {total})" if total and total != len(cfg) else ""))
+        for i in range(0, len(cfg), 16):
+            print(f"    {i:3d}: {cfg[i:i + 16].hex(' ')}")
+        print("\n".join(descrever_configuracao(cfg)))
 
 
 def checksum_imagem(caminho: str) -> tuple[int, int] | None:
@@ -173,6 +306,11 @@ class ReceptorAudio(threading.Thread):
                 import sounddevice as sd
             except ImportError:
                 raise SystemExit("para --audio instale: pip install sounddevice numpy")
+            except OSError as e:
+                # conda traz um libstdc++ mais antigo que o exigido pelo libjack do sistema
+                raise SystemExit(f"não foi possível carregar o PortAudio ({e}).\n"
+                                 "Rode com LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6 "
+                                 "ou atualize o conda: conda install -c conda-forge libstdcxx-ng")
             for taxa in (round(self.taxa), 48000, 44100):
                 try:
                     self.stream = sd.OutputStream(samplerate=taxa, channels=1, dtype="int16", latency="low")
@@ -260,10 +398,15 @@ def main() -> int:
                     help="ganho extra em dB no áudio do PC (reprodução e gravação), com saturação (padrão: 0)")
     ap.add_argument("--diag", action="store_true",
                     help="pede e mostra o pacote de diagnóstico da FPGA (depois de --teste, se usado)")
+    ap.add_argument("--usb", action="store_true",
+                    help="pede e mostra o estado do host USB da FPGA (USB_HOST = 1): VID/PID do teclado na porta USB-A")
+    ap.add_argument("--teclado-usb", action="store_true",
+                    help="teclado ligado na porta USB-A da dock (USB_HOST = 1): não abre entrada MIDI no PC; "
+                         "com --audio/--gravar devolve o som; Ctrl+C mostra o estado do host USB")
     ap.add_argument("-v", "--verbose", action="store_true", help="mostra cada mensagem enviada")
     args = ap.parse_args()
 
-    mido, serial = _imports()
+    mido, serial = _imports(precisa_midi=not (args.listar or args.teclado_usb or args.usb or args.diag or args.teste))
     if args.listar:
         listar(mido, serial)
         return 0
@@ -298,12 +441,29 @@ def main() -> int:
         if args.teste:
             tocar_teste(send)
             time.sleep(0.5)
-        if args.diag:
+        usb_agora = args.usb and not args.teclado_usb
+        if args.diag or usb_agora:
             if receptor:
                 receptor.parar.set()            # para o keep-alive antes do pedido
                 receptor.join(timeout=1)
+        if args.diag:
             diagnostico(ser, send)
-        if args.teste or args.diag:
+        if usb_agora:
+            diagnostico_usb(ser, send)
+        if args.teste or args.diag or usb_agora:
+            return 0
+
+        if args.teclado_usb:
+            print("teclado na porta USB-A da dock: toque à vontade; Ctrl+C mostra o estado do host USB")
+            try:
+                while True:
+                    time.sleep(0.2)
+            except KeyboardInterrupt:
+                pass
+            if receptor:
+                receptor.parar.set()            # o pacote só sai com o fluxo de áudio parado
+                receptor.join(timeout=1)
+            diagnostico_usb(ser, send)
             return 0
 
         names = mido.get_input_names()

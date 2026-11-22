@@ -94,6 +94,8 @@ Todos os alvos são executados a partir de `sim/`:
 | `make test-midi` | UART + parser MIDI: casos dirigidos, baud ±2 %, erros de enquadramento e 300 000 bytes aleatórios contra um modelo de referência. |
 | `make test-apu-midi` | Eventos MIDI → caixa de correio → driver SPC700 → S-DSP; analisa o áudio (afinação, acordes, velocidade, pan, troca de programa, volume, envelope, *voice stealing*, latência). |
 | `make test-top-midi` | Integração da cadeia completa no topo: bytes MIDI no pino `midi_rx` até os pinos I²S, o fluxo de áudio em `uart_tx` e o LED, etapa por etapa (ver abaixo). |
+| `make test-usb` | Host USB (`usb_host_probe` + PHY + FIFO) contra um dispositivo USB full-speed comportamental (`sim/usb_device_model.h`, com o descritor real do CTK-3500, que confere todos os CRC5/CRC16, NRZI e *bit stuffing*): reset de barramento, SOF a cada 1 ms, enumeração completa (`GET_DESCRIPTOR` do dispositivo e da configuração, `SET_ADDRESS`, `SET_CONFIGURATION`) com EP0 de 8, 64 e 32 bytes (este terminando com pacote de tamanho zero), MIDI pelo endpoint bulk achado no descritor (todos os CIN, rajada de 160 bytes em 3 pacotes, um pacote corrompido e um ACK perdido), NAK e CRC injetados, desconexão/reconexão. |
+| `make test-top-usb` | Topo completo com `USB_HOST = 1`: APU rodando junto com o host USB, enumeração do dispositivo modelo, os pacotes de estado `0xF9` e `0xFD` pedidos em sequência por `midi_rx`, e notas tocadas pelo USB (junto com uma pela UART) chegando ao driver e soando/soltando no áudio. |
 | `make run` | Toca a imagem `src/data/test_spc.spc.hex` (uma trilha `.spc`) e grava `sim/output/primer25k_nanospc_smoke.wav`, conferindo que o áudio decodificado dos pinos I²S é idêntico ao PCM do S-DSP. |
 
 `make test-top-midi` envia 157 bytes no estilo de um teclado real (*running
@@ -189,6 +191,113 @@ Atualmente, o driver responde a todos os canais, e outras mensagens
 | `i2s_lrclk` | B11 | PMOD J4, pino 7 → LCK |
 | `i2s_sdata` | D11 | PMOD J4, pino 9 → DIN |
 | +3V3 / GND | — | PMOD J4, pino 1 / pino 3 → VIN / GND do módulo |
+| `usb_dp` / `usb_dn` | L6 / K6 | Conector USB-A "USB Host" da dock (J13): VBUS em +5 V, *pull-downs* de 15 kΩ do host já montados |
+
+### Host USB (teste, `USB_HOST = 1`)
+
+A dock já vem montada como host USB (VBUS ligado ao +5 V, *pull-downs* de
+15 kΩ em D+ e D−, *pull-ups* de dispositivo não montados), então o teclado
+pode ser ligado direto na porta USB-A com um cabo USB A–B comum. Nesta etapa
+a FPGA só faz o começo da enumeração, sem CPU (`src/usb/usb_host_probe.v`):
+detecta o dispositivo, faz o reset de barramento, envia SOFs, lê o
+descritor do dispositivo (VID/PID, tamanho do EP0), atribui o endereço 1,
+lê o descritor de configuração (até 256 bytes, guardado em uma BSRAM) e
+ativa a configuração. No descritor ele procura o primeiro endpoint bulk IN
+de uma interface MIDI Streaming (classe 01/03; no CTK-3500, `0x82`), e então
+o consulta a cada quadro de 1 ms. Cada evento USB-MIDI de 4 bytes vira de 1
+a 3 bytes MIDI (pelo *Code Index Number*), que atravessam para o domínio do
+`dclk` por uma FIFO de dois clocks — só publicada quando o pacote passa no
+CRC e no *toggle* DATA0/DATA1 — e entram num segundo `midi_parser`; os
+eventos se juntam aos da UART antes da caixa de correio, então o teclado no
+PC continua funcionando ao mesmo tempo. O `--usb` mostra as interfaces, os
+jacks MIDI, os endpoints encontrados e os contadores de bytes/pacotes MIDI. O PHY e o motor de
+pacotes (SIE) são os núcleos abertos da ultraembedded (ver
+`THIRD_PARTY_NOTICES.md`); o clock de 48 MHz vem de um segundo PLL
+(`src/gowin_pll/gowin_pll48.v`).
+
+Para ler o estado (gravado com `USB_HOST = 1`, padrão neste branch):
+
+```bash
+python3 tools/midi_bridge.py --porta /dev/ttyUSB1 --usb
+# tocar o teclado USB ouvindo pelo PC; Ctrl+C mostra o estado do host USB
+python3 tools/midi_bridge.py --porta /dev/ttyUSB1 --teclado-usb --audio
+```
+
+Para compilar sem o host USB, use `USB_HOST = 0` e remova de
+`primer25k_nanospc.sdc` o `create_clock` de `clk48` e o `set_clock_groups`.
+
+#### Roteiro: testar um teclado USB novo (com o DAC I²S)
+
+Testado até agora com o Casio CTK-3500 (VID:PID `07CF:6803`, endpoint MIDI
+`0x82`). Para outro teclado, a partir de um checkout limpo do branch:
+
+1. **Código e dependências** (spcasm e Verilator não são necessários: a
+   imagem de boot `src/data/midi_boot.spc.hex` já está versionada):
+
+   ```bash
+   git fetch && git checkout feat/usb-integration && git pull
+   pip install pyserial numpy sounddevice    # sounddevice só para ouvir no PC (--audio)
+   ```
+
+2. **Bitstream**: abra `primer25k_nanospc.gprj` na Gowin IDE, rode
+   *Synthesis* e *Place & Route* e grave `impl/pnr/primer25k_nanospc.fs`
+   como em [Síntese e gravação](#síntese-e-gravação). As opções do projeto
+   (SystemVerilog 2017, READY/CPU como GPIO, *place/route* 2) já vêm em
+   `impl/primer25k_nanospc_process_config.json`.
+
+3. **Ligações**, com a placa desligada:
+   - DAC PCM5102A no PMOD J4 (ver [Pinos](#pinos) e
+     [Módulo DAC PCM5102A](#módulo-dac-pcm5102a)): pino 5 → BCK, 7 → LCK,
+     9 → DIN, 1 → VIN (3,3 V), 3 → GND; no módulo, SCK em GND, FMT baixo,
+     XSMT alto; fone ou caixa na saída do módulo.
+   - Teclado na porta **USB-A** da dock com um cabo USB A–B comum (a porta
+     do teclado costuma se chamar "USB to Host"). Se o teclado tiver fonte
+     própria, ligue-a.
+   - USB-C da placa no PC (alimentação, gravação e a serial).
+
+4. **Porta serial**. No Linux, depois de gravar:
+
+   ```bash
+   sudo modprobe ftdi_sio
+   python3 tools/midi_bridge.py --listar    # a UART da FPGA é a 2ª porta, em geral /dev/ttyUSB1
+   ```
+
+   No Windows a porta é um `COMx` (também a segunda do par que a placa cria).
+
+5. **Tocar**: o LED READY deve ficar aceso (e piscar com áudio). Rode, toque
+   notas soltas, acordes e segure algumas, e então aperte Ctrl+C:
+
+   ```bash
+   python3 tools/midi_bridge.py --porta /dev/ttyUSB1 --teclado-usb           # som só no DAC
+   python3 tools/midi_bridge.py --porta /dev/ttyUSB1 --teclado-usb --audio   # também no PC
+   ```
+
+   No conda, se o `--audio` acusar `GLIBCXX_...` ao carregar o PortAudio,
+   prefixe o comando com `LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6`.
+
+6. **Perfil para enviar** (sem desligar nada depois do passo 5):
+
+   ```bash
+   python3 tools/midi_bridge.py --porta /dev/ttyUSB1 --usb > perfil_usb_TECLADO.txt
+   lsusb                                             # ache a linha do teclado: ID vvvv:pppp
+   sudo lsusb -v -d vvvv:pppp > lsusb_TECLADO.txt    # Linux; o mesmo descritor visto pelo PC
+   ```
+
+   O `lsusb` exige o teclado ligado ao PC (troque o cabo para uma porta do
+   PC só para esse comando). Envie os dois arquivos e diga se o som saiu no
+   DAC.
+
+Como ler o `--usb`:
+
+| O que aparece | Significado |
+| --- | --- |
+| `estado: recebendo MIDI` e `recebidos: N bytes MIDI` crescendo ao tocar | Compatível. Cerca de 3 bytes por Note On/Off. |
+| `configurado, sem endpoint MIDI` | O descritor não tem interface MIDI Streaming (01/03) com endpoint IN; o despejo do descritor mostra o que há. |
+| `linha D+/D-: K` e `desconectado` | Dispositivo *low-speed*: este host só faz *full speed*. |
+| `linha D+/D-: SE0` | Nada detectado: cabo, porta (tem de ser a USB-A da dock) ou teclado sem alimentação. |
+| Parado em um `pedido`, com `timeouts` ou STALL subindo | O teclado recusa um dos pedidos; o nome do pedido diz qual. |
+| `conexões` aumentando sozinho | O teclado está reiniciando; em geral alimentação (atributos `80` e consumo alto no descritor = alimentado pela dock). |
+| `descritor de configuração: 256 bytes (o dispositivo informa N)` | Descritor maior que o buffer de 256 bytes. |
 
 ### Módulo DAC PCM5102A
 

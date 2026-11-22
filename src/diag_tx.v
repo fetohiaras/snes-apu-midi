@@ -11,7 +11,7 @@ module diag_tx #(
     input  wire           resetn,
     input  wire           start,
     input  wire [8*N-1:0] data,
-    output reg            tx,
+    output reg            tx = 1'b1,
     output wire           busy
 );
 
