@@ -228,8 +228,9 @@ Para compilar sem o host USB, use `USB_HOST = 0` e remova de
 
 #### Roteiro: testar um teclado USB novo (com o DAC I²S)
 
-Testado até agora com o Casio CTK-3500 (VID:PID `07CF:6803`, endpoint MIDI
-`0x82`). Para outro teclado, a partir de um checkout limpo do branch:
+Testado na placa com o Casio CTK-3500 (VID:PID `07CF:6803`, endpoint MIDI
+`0x82`); o Spring Seasons 61 (GZU-tek `0716:5022`, endpoint `0x81`, descritor
+tirado do `lsusb`) passa na simulação (`make test-usb`). Para outro teclado, a partir de um checkout limpo do branch:
 
 1. **Código e dependências** (spcasm e Verilator não são necessários: a
    imagem de boot `src/data/midi_boot.spc.hex` já está versionada):

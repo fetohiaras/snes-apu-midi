@@ -69,6 +69,7 @@ int main(int argc, char** argv) {
         }
         return true;
     };
+    int want_ep = 0x82;
     auto enum_ok = [&](int n, const char* what) {
         run_until([] { return false; }, 1 * MS);      // let the device see the final ACK
         check(desc_ok() && dev.descriptors_sent == n, (std::string(what) + ": device descriptor").c_str(),
@@ -81,7 +82,7 @@ int main(int argc, char** argv) {
               "device %ld", dev.configuration);
         check(dev.tokens_to_old_address == 0, (std::string(what) + ": nothing sent to address 0 afterwards").c_str(),
               "%ld tokens", dev.tokens_to_old_address);
-        check(top.midi_ep == 0x82 && top.midi_ep_size == 64, (std::string(what) + ": MIDI IN endpoint 0x82, 64 bytes").c_str(),
+        check(top.midi_ep == want_ep && top.midi_ep_size == 64, (std::string(what) + ": MIDI IN endpoint found, 64 bytes").c_str(),
               "0x%02lx, %ld bytes", top.midi_ep, top.midi_ep_size);
     };
 
@@ -201,6 +202,38 @@ int main(int argc, char** argv) {
     done = run_until([&] { return top.state == S_POLL; }, 400 * MS);
     check(done, "third enumeration reached DONE");
     enum_ok(3, "32-byte EP0");
+
+    // Spring Seasons 61 (GZU-tek 0716:5022), descriptors as reported by
+    // lsusb: bulk IN 0x81, 7-byte endpoint descriptors, bus powered.
+    std::printf("replug: Spring Seasons 61 profile (0716:5022, bulk IN 0x81)\n");
+    dev.attached = false;
+    run_until([&] { return top.state == S_DETACHED; }, 2 * MS);
+    run_until([] { return false; }, 20 * MS);
+    dev.descriptor = {0x12, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x40, 0x16, 0x07, 0x22, 0x50,
+                      0x00, 0x01, 0x01, 0x02, 0x03, 0x01};
+    dev.config = {
+            0x09, 0x02, 0x61, 0x00, 0x02, 0x01, 0x00, 0x80, 0x32, 0x09, 0x04, 0x00, 0x00, 0x00, 0x01, 0x01,
+            0x00, 0x00, 0x09, 0x24, 0x01, 0x00, 0x01, 0x09, 0x00, 0x01, 0x01, 0x09, 0x04, 0x01, 0x00, 0x02,
+            0x01, 0x03, 0x00, 0x00, 0x07, 0x24, 0x01, 0x00, 0x01, 0x3d, 0x00, 0x06, 0x24, 0x02, 0x01, 0x01,
+            0x00, 0x06, 0x24, 0x02, 0x02, 0x02, 0x00, 0x09, 0x24, 0x03, 0x01, 0x03, 0x01, 0x02, 0x01, 0x00,
+            0x09, 0x24, 0x03, 0x02, 0x04, 0x01, 0x01, 0x01, 0x00, 0x07, 0x05, 0x81, 0x02, 0x40, 0x00, 0x00,
+            0x05, 0x25, 0x01, 0x01, 0x03, 0x07, 0x05, 0x02, 0x02, 0x40, 0x00, 0x00, 0x05, 0x25, 0x01, 0x01,
+            0x01,
+    };
+    dev.max_packet = 64;
+    dev.bulk_ep = 1;
+    want_ep = 0x81;
+    dev.attached = true;
+    done = run_until([&] { return top.state == S_POLL; }, 400 * MS);
+    check(done, "Spring Seasons profile reached MIDI polling");
+    enum_ok(4, "Spring Seasons");
+    midi.clear();
+    expect.clear();
+    ev(0x09, 0x90, 60, 90); ev(0x09, 0x90, 64, 90); ev(0x09, 0x90, 67, 90);
+    ev(0x08, 0x80, 60, 0);  ev(0x08, 0x80, 64, 0);  ev(0x08, 0x80, 67, 0);
+    sent = run_until([&] { return dev.bulk_empty(); }, 20 * MS);
+    run_until([] { return false; }, 1 * MS);
+    check(sent && midi == expect, "Spring Seasons: chord on/off received", "%ld bytes", static_cast<long>(midi.size()));
 
     std::printf("idle frames\n");
     sofs = dev.sofs;
