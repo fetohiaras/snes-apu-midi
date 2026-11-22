@@ -84,6 +84,18 @@ THIRD_PARTY_NOTICES.md      licença e origem do código do NanoSPC
 - **Teste no hardware**: `pip install mido python-rtmidi pyserial numpy sounddevice`
   (`sounddevice` só é necessário para ouvir o áudio no PC).
 
+## Diagnóstico de hardware antes do DAC
+
+Para separar falhas de USB-UART de falhas do SPC700/APU, o repositório possui
+agora dois projetos mínimos:
+
+- `primer25k_uart_smoketest.gprj`: testa somente BL616/UART -> FPGA -> LED.
+- `primer25k_core_smoketest.gprj`: testa `spc_parser` + SPC700 + portas da APU
+  + `midi_mailbox`, usando eventos internos e uma imagem SPC mínima incluída.
+
+Veja o passo a passo em `DIAGNOSTICS.md`. Antes de qualquer build, rode
+`py tools/preflight.py`.
+
 ## Simulação
 
 Todos os alvos são executados a partir de `sim/`:
