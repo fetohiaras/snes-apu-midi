@@ -1,20 +1,34 @@
 #!/usr/bin/env python3
 """Build the MIDI synthesizer's boot image.
 
-  1. Encode the instrument bank (tools/soundbank.py) to BRR files and write
-     an spcasm include with the sample directory, pitch and instrument tables.
-  2. Assemble src/driver/midi_driver.s plus that bank with spcasm.
+  build_midi_image.py BUILD_DIR                  synthetic test bank (simulation)
+  build_midi_image.py BUILD_DIR --bank BANK.json SoundFont bank (synthesis)
+
+  1. Prepare the instruments: the synthetic single-cycle waves of
+     tools/soundbank.py, or SoundFont samples (tools/instrument.py) as
+     described by a bank file written by tools/soundfont_gui.py.
+  2. Write an spcasm include with the sample directory, instrument table,
+     velocity curve, one pitch table per instrument, the echo settings and
+     the BRR data, and assemble it with src/driver/midi_driver.s.
   3. Pack the RAM image into a standard .spc (PC at the driver entry, DSP
-     registers in their power-on state) and convert it with spc_to_hex.py.
+     registers in their power-on state) and convert it with spc_to_hex.
+
+A-RAM layout:
+  $0200 sample directory   $0300 instruments (8 x 8 bytes)   $0340 echo FIR
+  $0380 velocity curve     $0500 driver (must end below $0C00)
+  $0C00 pitch tables (256 bytes per instrument)   $1400 BRR samples
+  top   echo buffer: ECHO delay * 2 KB ending at $FFFF
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -26,46 +40,146 @@ SPC_TO_HEX = ROOT / "tools" / "spc_to_hex.py"
 
 ENTRY = 0x0500          # `org` of the driver's reset label
 DIR_ADDR = 0x0200
-PITCH_ADDR = 0x0300
-INSTR_ADDR = 0x0400
-VEL_ADDR = 0x0480
-BRR_ADDR = 0x1000
+INSTR_ADDR = 0x0300
+FIR_ADDR = 0x0340
+VEL_ADDR = 0x0380
+PITCH_ADDR = 0x0C00
+BRR_ADDR = 0x1400
+MAX_INSTR = 8
 
 
-def write_bank(build: Path, driver: Path) -> Path:
-    names = list(soundbank.WAVES)
+@dataclass
+class Inst:
+    name: str
+    brr: bytes
+    loop_block: int | None      # None: plays once
+    pitch: bytes                # 128 PITCH words
+    adsr1: int
+    adsr2: int
+    release: int                # GAIN byte at note off, 0 = key off
+
+
+@dataclass
+class Echo:
+    delay: int = 0              # EDL, 16 ms steps (2 KB each)
+    feedback: int = 0           # EFB, signed
+    volume: int = 0             # EVOL, initial value (CC91 changes it)
+    fir: tuple = (127, 0, 0, 0, 0, 0, 0, 0)
+    voices: int = 0             # EON
+
+    @property
+    def enabled(self) -> bool:
+        return self.voices != 0 and (self.volume != 0 or self.feedback != 0)
+
+    @property
+    def esa(self) -> int:       # page of the buffer start
+        return 0xFF if self.delay == 0 else 0x100 - 8 * self.delay
+
+    @property
+    def buffer_bytes(self) -> int:
+        return 4 if self.delay == 0 else self.delay * 2048
+
+
+def synthetic_bank() -> tuple[list[Inst], Echo]:
+    """The simulation bank: band-limited single-cycle waves, echo off."""
+    insts = []
+    for ins in soundbank.INSTRUMENTS:
+        insts.append(Inst(ins.name, soundbank.brr_encode(soundbank.WAVES[ins.wave], loop=True), 0,
+                          soundbank.pitch_table(), ins.adsr1, ins.adsr2, 0))
+    return insts, Echo()
+
+
+def file_bank(path: Path) -> tuple[list[Inst], Echo]:
+    """A bank file: SoundFont instruments and echo settings (see soundfont_gui.py)."""
+    import instrument
+    from sf2 import SoundFont
+    spec = json.loads(path.read_text())
+    fonts: dict[str, SoundFont] = {}
+    insts = []
+    for d in spec["instruments"][:MAX_INSTR]:
+        sf_path = str((path.parent / d.get("sf2", spec.get("sf2", ""))).resolve())
+        sf = fonts.setdefault(sf_path, SoundFont(sf_path))
+        s = sf.sample_for(d.get("bank", 0), d["program"], d.get("key", 60))
+        p = instrument.prepare(s, d.get("target_rate", 16000), d.get("max_ms", 600))
+        env = d.get("env") or instrument.adsr_from_sf2(s)
+        a1, a2, rel = instrument.adsr_regs(env)
+        insts.append(Inst(d.get("name", sf.preset_name(d.get("bank", 0), d["program"])),
+                          p.brr, p.loop_block, instrument.pitch_table(p), a1, a2, rel))
+        print(f"  {insts[-1].name:24s} {len(p.brr):6d} bytes  SNR {instrument.snr_db(p):5.1f} dB  {p.loop_note}")
+    e = spec.get("echo", {})
+    echo = Echo(int(e.get("delay", 0)), int(e.get("feedback", 0)), int(e.get("volume", 0)),
+                tuple(int(v) for v in e.get("fir", (127, 0, 0, 0, 0, 0, 0, 0))), int(e.get("voices", 0)))
+    return insts, echo
+
+
+def write_bank(build: Path, driver: Path, insts: list[Inst], echo: Echo) -> Path:
+    if not insts:
+        raise SystemExit("empty bank")
+    n = 1
+    while n < len(insts):
+        n *= 2
+    if n > MAX_INSTR:
+        raise SystemExit(f"at most {MAX_INSTR} instruments")
+    slots = [insts[i % len(insts)] for i in range(n)]     # the driver masks the program number
+
+    byte = lambda v: f"${v & 0xFF:02X}"
     lines = [
         "; Generated by tools/build_midi_image.py -- do not edit.",
-        f"NUM_INSTR = {len(soundbank.INSTRUMENTS)}",
+        f"NUM_INSTR = {n}",
+        f"ECHO_EDL = {echo.delay}",
+        f"ECHO_ESA = ${echo.esa:02X}",
+        f"ECHO_EFB = {byte(echo.feedback)}",
+        f"ECHO_EVOL = {byte(echo.volume)}",
+        f"ECHO_EON = {byte(echo.voices)}",
+        f"ECHO_FLG = {'$00' if echo.enabled else '$20'}",
         "",
         f"org ${DIR_ADDR:04X}",
         "sample_dir:",
     ]
-    lines += [f"    dw brr_{n}, brr_{n}" for n in names]
-    lines += ["", f"org ${PITCH_ADDR:04X}", "pitch_table:"]
-    table = soundbank.pitch_table()
-    for i in range(0, 256, 16):
-        words = [int.from_bytes(table[j:j + 2], "little") for j in range(i, i + 16, 2)]
-        lines.append("    dw " + ", ".join(f"${w:04X}" for w in words))
-    lines += ["", f"org ${INSTR_ADDR:04X}", "instruments:  ; srcn, adsr1, adsr2, transpose"]
-    for ins in soundbank.INSTRUMENTS:
-        lines.append(f"    db {names.index(ins.wave)}, ${ins.adsr1:02X}, ${ins.adsr2:02X}, "
-                     f"${ins.transpose & 0xFF:02X}  ; {ins.name}")
+    for i, ins in enumerate(insts):
+        loop = f"brr_{i} + {9 * ins.loop_block}" if ins.loop_block is not None else f"brr_{i}"
+        lines.append(f"    dw brr_{i}, {loop}")
+    lines += ["", f"org ${INSTR_ADDR:04X}",
+              "instruments:  ; srcn, adsr1, adsr2, release gain, pitch table, 2 spare"]
+    for s in slots:
+        i = insts.index(s)
+        lines.append(f"    db {i}, ${s.adsr1:02X}, ${s.adsr2:02X}, ${s.release:02X}  ; {s.name}")
+        lines.append(f"    dw pitch_{i}")
+        lines.append("    db 0, 0")
+    lines += ["", f"org ${FIR_ADDR:04X}", "echo_fir:", "    db " + ", ".join(byte(c) for c in echo.fir)]
     lines += ["", f"org ${VEL_ADDR:04X}", "velocity_table:  ; velocity -> level (soundbank.velocity_curve)"]
     vt = soundbank.velocity_table()
     for i in range(0, 128, 16):
         lines.append("    db " + ", ".join(f"${v:02X}" for v in vt[i:i + 16]))
+    for i, ins in enumerate(insts):
+        lines += ["", f"org ${PITCH_ADDR + 256 * i:04X}", f"pitch_{i}:"]
+        for j in range(0, 256, 16):
+            words = [int.from_bytes(ins.pitch[k:k + 2], "little") for k in range(j, j + 16, 2)]
+            lines.append("    dw " + ", ".join(f"${w:04X}" for w in words))
     lines += ["", f"org ${BRR_ADDR:04X}"]
-    for n in names:
-        (build / f"{n}.brr").write_bytes(soundbank.brr_encode(soundbank.WAVES[n], loop=True))
-        lines.append(f"brr_{n}: incbin \"{n}.brr\"")
-    if len(soundbank.INSTRUMENTS) & (len(soundbank.INSTRUMENTS) - 1):
-        raise SystemExit("the driver masks the program number: use a power-of-two instrument count")
+    for i, ins in enumerate(insts):
+        (build / f"inst{i}.brr").write_bytes(ins.brr)
+        lines.append(f"brr_{i}: incbin \"inst{i}.brr\"")
+
+    brr_end = BRR_ADDR + sum(len(i.brr) for i in insts)
+    if brr_end > echo.esa * 256:
+        raise SystemExit(f"samples end at ${brr_end:04X}, past the echo buffer at ${echo.esa * 256:04X}: "
+                         "shorten the samples or the echo delay")
+    print(f"A-RAM: samples ${BRR_ADDR:04X}-${brr_end:04X} ({brr_end - BRR_ADDR} bytes), "
+          f"echo buffer ${echo.esa * 256:04X}-$FFFF, free {echo.esa * 256 - brr_end} bytes")
 
     bank = build / "image.s"
     driver_rel = os.path.relpath(driver, build)
     bank.write_text(f"include \"{driver_rel}\"\n\n" + "\n".join(lines) + "\n")
     return bank
+
+
+def check_layout(ram: bytes, insts: list[Inst]) -> None:
+    """The driver must not run into the pitch tables (spcasm does not check)."""
+    for i, ins in enumerate(insts):
+        a = PITCH_ADDR + 256 * i
+        if ram[a:a + 256] != ins.pitch:
+            raise SystemExit(f"pitch table {i} at ${a:04X} was overwritten: the driver is too long")
 
 
 def pack_spc(ram: bytes, out: Path) -> None:
@@ -91,25 +205,34 @@ def pack_spc(ram: bytes, out: Path) -> None:
     out.write_bytes(bytes(header) + ram + bytes(dsp) + bytes(0x40) + bytes(0x40))
 
 
+def build(build_dir: Path, bank: Path | None = None, driver: Path = DRIVER,
+          spcasm: str = os.environ.get("SPCASM", "spcasm")) -> Path:
+    """Build the image; returns the .spc.hex path."""
+    build_dir = build_dir.resolve()
+    build_dir.mkdir(parents=True, exist_ok=True)
+    if shutil.which(spcasm) is None:
+        raise SystemExit(f"spcasm not found ('{spcasm}'); set SPCASM=/path/to/spcasm")
+    insts, echo = file_bank(bank) if bank else synthetic_bank()
+    source = write_bank(build_dir, driver.resolve(), insts, echo)
+    ram_bin = build_dir / "midi_boot.bin"
+    subprocess.run([spcasm, "-f", "plain", str(source), str(ram_bin)], check=True)
+    ram = ram_bin.read_bytes()
+    check_layout(ram, insts)
+    spc = build_dir / "midi_boot.spc"
+    pack_spc(ram, spc)
+    hexfile = build_dir / "midi_boot.spc.hex"
+    subprocess.run([sys.executable, str(SPC_TO_HEX), str(spc), str(hexfile)], check=True)
+    return hexfile
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("build_dir", type=Path, help="directory for generated files")
+    ap.add_argument("--bank", type=Path, help="bank file (JSON) of SoundFont instruments; default: synthetic test bank")
     ap.add_argument("--driver", type=Path, default=DRIVER, help="driver source (default: %(default)s)")
     ap.add_argument("--spcasm", default=os.environ.get("SPCASM", "spcasm"), help="spcasm executable")
     args = ap.parse_args()
-
-    build = args.build_dir.resolve()
-    build.mkdir(parents=True, exist_ok=True)
-    if shutil.which(args.spcasm) is None:
-        raise SystemExit(f"spcasm not found ('{args.spcasm}'); set SPCASM=/path/to/spcasm")
-
-    source = write_bank(build, args.driver.resolve())
-    ram_bin = build / "midi_boot.bin"
-    subprocess.run([args.spcasm, "-f", "plain", str(source), str(ram_bin)], check=True)
-
-    spc = build / "midi_boot.spc"
-    pack_spc(ram_bin.read_bytes(), spc)
-    subprocess.run([sys.executable, str(SPC_TO_HEX), str(spc), str(build / "midi_boot.spc.hex")], check=True)
+    build(args.build_dir, args.bank, args.driver, args.spcasm)
     return 0
 
 

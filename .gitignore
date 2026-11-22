@@ -21,6 +21,7 @@
 **/obj_usb/
 **/obj_top_usb/
 /sim/build_midi/
+/sim/build_sf/
 **/output/
 **/*.vcd
 **/*.fst
@@ -39,3 +40,4 @@
 
 # Docs
 /docs/*
+/build/

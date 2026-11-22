@@ -18,6 +18,7 @@
 //   4 VOLUME     Bn 07 val                   value       0
 //   5 PAN        Bn 0A val                   value       0
 //   6 ALL_OFF    Bn 78 xx / Bn 7B xx         0           0
+//   7 ECHO       Bn 5B val (effects depth)   value       0
 //
 // Other messages are ignored. Events arriving while a command is in flight
 // wait in a FIFO; if it overflows the event is dropped and `dropped` is set.
@@ -52,6 +53,7 @@ module midi_mailbox #(
     localparam [3:0] CMD_VOLUME   = 4'd4;
     localparam [3:0] CMD_PAN      = 4'd5;
     localparam [3:0] CMD_ALL_OFF  = 4'd6;
+    localparam [3:0] CMD_ECHO     = 4'd7;
 
     // ------------------------------------------------------------------
     // MIDI -> command translation
@@ -74,6 +76,7 @@ module midi_mailbox #(
                 case (ev_data1)
                     7'd7:           map_cmd = CMD_VOLUME;
                     7'd10:          map_cmd = CMD_PAN;
+                    7'd91:          map_cmd = CMD_ECHO;      // effects depth -> echo volume
                     7'd120, 7'd123: begin map_cmd = CMD_ALL_OFF; map_a0 = 7'd0; end
                     default:        map_ok = 1'b0;
                 endcase

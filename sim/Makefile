@@ -67,9 +67,12 @@ SPCASM       ?= spcasm
 MIDI_IMG_DIR := build_midi
 APU_MIDI_DIR := obj_apu_midi
 
+# Simulation image: the synthetic bank (single-cycle waves, echo off), whose
+# pitches and spectra the checks below know.
 $(MIDI_IMG_DIR)/midi_boot.spc.hex: ../src/driver/midi_driver.s ../tools/build_midi_image.py \
 		../tools/soundbank.py ../tools/spc_to_hex.py
 	SPCASM=$(SPCASM) python3 ../tools/build_midi_image.py $(MIDI_IMG_DIR)
+SIM_BOOT := '-GBOOT_IMAGE="sim/$(MIDI_IMG_DIR)/midi_boot.spc.hex"'
 
 $(APU_MIDI_DIR)/Vtb_apu_midi_top: tb_apu_midi.cpp tb_apu_midi_top.v ../src/midi/midi_mailbox.v $(APU_RTL)
 	mkdir -p $(APU_MIDI_DIR)
@@ -86,12 +89,15 @@ test-apu-midi: $(APU_MIDI_DIR)/Vtb_apu_midi_top $(MIDI_IMG_DIR)/midi_boot.spc.he
 		output/apu_midi.wav $(MIDI_IMG_DIR)/summary.txt
 	python3 check_apu_midi.py check output/apu_midi.wav $(MIDI_IMG_DIR)/summary.txt
 
-# The synthesis top boots src/data/midi_boot.spc.hex; `make midi-image`
-# (re)generates it before running Gowin.
-../src/data/midi_boot.spc.hex: $(MIDI_IMG_DIR)/midi_boot.spc.hex
-	cp $< $@
+# The synthesis top boots src/data/midi_boot.spc.hex: the SoundFont bank in
+# BANK (edited with tools/soundfont_gui.py). `make midi-image` regenerates
+# it before running Gowin.
+BANK       ?= ../soundfont/bank.json
+SF_IMG_DIR := build_sf
 
-midi-image: ../src/data/midi_boot.spc.hex
+midi-image:
+	SPCASM=$(SPCASM) python3 ../tools/build_midi_image.py $(SF_IMG_DIR) --bank $(BANK)
+	cp $(SF_IMG_DIR)/midi_boot.spc.hex ../src/data/midi_boot.spc.hex
 
 # Full-chain integration: MIDI bytes on the midi_rx pin of the real top,
 # checked stage by stage (see check_top_midi.py).
@@ -103,13 +109,13 @@ PC_DECIM     := 4
 $(TOP_MIDI_DIR)/V$(TOP): tb_top_midi.cpp $(RTL)
 	mkdir -p $(TOP_MIDI_DIR)
 	verilator --sv --top-module $(TOP) --cc --exe -O3 \
-		--Mdir $(TOP_MIDI_DIR) -GUART_BAUD=$(UART_BAUD) -GUSB_HOST=0 -Wno-fatal \
+		--Mdir $(TOP_MIDI_DIR) -GUART_BAUD=$(UART_BAUD) -GUSB_HOST=0 -Wno-fatal $(SIM_BOOT) \
 		-GPC_AUDIO_FORMAT=$(PC_FORMAT) -GPC_AUDIO_DECIM=$(PC_DECIM) \
 		-I../src -I../src/spc_core -I../src/spc_core/spc700 \
 		$(RTL) tb_top_midi.cpp
 	$(MAKE) -C $(TOP_MIDI_DIR) -f V$(TOP).mk V$(TOP)
 
-test-top-midi: $(TOP_MIDI_DIR)/V$(TOP) $(APU_MIDI_DIR)/Vtb_apu_midi_top ../src/data/midi_boot.spc.hex
+test-top-midi: $(TOP_MIDI_DIR)/V$(TOP) $(APU_MIDI_DIR)/Vtb_apu_midi_top $(MIDI_IMG_DIR)/midi_boot.spc.hex
 	python3 check_top_midi.py stimulus $(MIDI_IMG_DIR) $(UART_BAUD) > $(MIDI_IMG_DIR)/top_frames.txt
 	cd .. && sim/$(TOP_MIDI_DIR)/V$(TOP) sim/$(MIDI_IMG_DIR)/uart.txt \
 		$$(cat sim/$(MIDI_IMG_DIR)/top_frames.txt) sim/$(MIDI_IMG_DIR) $(UART_BAUD)
@@ -124,12 +130,12 @@ TOP_USB_DIR := obj_top_usb
 $(TOP_USB_DIR)/V$(TOP): tb_top_usb.cpp usb_device_model.h $(RTL)
 	mkdir -p $(TOP_USB_DIR)
 	verilator --sv --top-module $(TOP) --cc --exe -O3 -Wno-fatal \
-		--Mdir $(TOP_USB_DIR) -GUART_BAUD=$(UART_BAUD) -GUSB_HOST=1 \
+		--Mdir $(TOP_USB_DIR) -GUART_BAUD=$(UART_BAUD) -GUSB_HOST=1 $(SIM_BOOT) \
 		-I../src -I../src/spc_core -I../src/spc_core/spc700 \
 		$(RTL) tb_top_usb.cpp
 	$(MAKE) -C $(TOP_USB_DIR) -f V$(TOP).mk V$(TOP)
 
-test-top-usb: $(TOP_USB_DIR)/V$(TOP) ../src/data/midi_boot.spc.hex
+test-top-usb: $(TOP_USB_DIR)/V$(TOP) $(MIDI_IMG_DIR)/midi_boot.spc.hex
 	cd .. && sim/$(TOP_USB_DIR)/V$(TOP) $(UART_BAUD)
 
 $(BUILD_DIR)/V$(TOP): sim_main.cpp $(RTL)
@@ -158,4 +164,4 @@ spc-to-hex:
 	python3 ../tools/spc_to_hex.py "$(SPC)" "$(HEX)"
 
 clean:
-	rm -rf $(BUILD_DIR) $(I2S_DIR) $(MIDI_DIR) $(USB_DIR) $(APU_MIDI_DIR) $(TOP_MIDI_DIR) $(TOP_USB_DIR) $(MIDI_IMG_DIR) output
+	rm -rf $(BUILD_DIR) $(I2S_DIR) $(MIDI_DIR) $(USB_DIR) $(APU_MIDI_DIR) $(TOP_MIDI_DIR) $(TOP_USB_DIR) $(MIDI_IMG_DIR) $(SF_IMG_DIR) output

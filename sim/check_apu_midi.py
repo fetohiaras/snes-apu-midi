@@ -50,7 +50,7 @@ SCRIPT: list[tuple[float, int, int, int]] = [
     (5.00, 0xB0, 123, 0),                      # all notes off
 ]
 
-UNMAPPED = sum(1 for _, s, d1, _ in SCRIPT if s >> 4 == 0xE or (s >> 4 == 0xB and d1 not in (7, 10, 120, 123)))
+UNMAPPED = sum(1 for _, s, d1, _ in SCRIPT if s >> 4 == 0xE or (s >> 4 == 0xB and d1 not in (7, 10, 91, 120, 123)))
 
 
 def sample(t: float) -> int:
