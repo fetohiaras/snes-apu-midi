@@ -1,0 +1,22 @@
+{
+  "sf2": "/usr/share/sounds/sf2/FluidR3_GM.sf2",
+  "instruments": [
+    {"name": "Piano", "bank": 0, "program": 0, "key": 60, "target_rate": 16000, "max_ms": 500,
+     "env": {"attack": 15, "decay": 4, "sustain_level": 3, "sustain_rate": 12, "release": 19}},
+    {"name": "Piano elétrico", "bank": 0, "program": 4, "key": 60, "target_rate": 16000, "max_ms": 450,
+     "env": {"attack": 15, "decay": 3, "sustain_level": 4, "sustain_rate": 11, "release": 20}},
+    {"name": "Órgão", "bank": 0, "program": 16, "key": 60, "target_rate": 16000, "max_ms": 300,
+     "env": {"attack": 14, "decay": 7, "sustain_level": 7, "sustain_rate": 0, "release": 22}},
+    {"name": "Cordas", "bank": 0, "program": 48, "key": 60, "target_rate": 16000, "max_ms": 500,
+     "env": {"attack": 7, "decay": 7, "sustain_level": 6, "sustain_rate": 0, "release": 18}},
+    {"name": "Flauta", "bank": 0, "program": 73, "key": 72, "target_rate": 16000, "max_ms": 400,
+     "env": {"attack": 11, "decay": 7, "sustain_level": 7, "sustain_rate": 0, "release": 22}},
+    {"name": "Trompete", "bank": 0, "program": 56, "key": 60, "target_rate": 16000, "max_ms": 400,
+     "env": {"attack": 13, "decay": 5, "sustain_level": 6, "sustain_rate": 0, "release": 23}},
+    {"name": "Baixo", "bank": 0, "program": 33, "key": 40, "target_rate": 11025, "max_ms": 500,
+     "env": {"attack": 15, "decay": 4, "sustain_level": 4, "sustain_rate": 13, "release": 24}},
+    {"name": "Onda quadrada", "bank": 0, "program": 80, "key": 60, "target_rate": 16000, "max_ms": 300,
+     "env": {"attack": 15, "decay": 7, "sustain_level": 7, "sustain_rate": 0, "release": 24}}
+  ],
+  "echo": {"delay": 4, "feedback": 45, "volume": 30, "fir": [127, 0, 0, 0, 0, 0, 0, 0], "voices": 255}
+}
